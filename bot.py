@@ -238,7 +238,7 @@ async def updater(t: Track):
 
 async def start_stream(chat_id: int, t: Track):
     kw = dict(
-        audio_parameters=AudioQuality.STUDIO,  # 96 kHz stereo
+        audio_parameters=AudioQuality.HIGH,  # 48 kHz stereo
         audio_flags=MediaStream.Flags.REQUIRED,
         video_flags=MediaStream.Flags.IGNORE,
     )
@@ -248,9 +248,11 @@ async def start_stream(chat_id: int, t: Track):
         stream = MediaStream(t.url, **kw)
     try:
         await calls.play(chat_id, stream)
+        unmuted = await calls.unmute(chat_id)
     except Exception as e:
         print("calls.play failed:", repr(e), flush=True)
         raise
+    print(f"audio stream started: {t.source} ({t.title}); unmute={unmuted}", flush=True)
     t.started = time.time()
     t.paused_at = 0.0
 
