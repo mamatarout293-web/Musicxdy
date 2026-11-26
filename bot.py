@@ -624,6 +624,7 @@ async def ensure_assistant_in_group(chat_id: int) -> bool:
     except Exception as lookup_error:
         print(f"assistant is not in group {chat_id}: {type(lookup_error).__name__}", flush=True)
 
+    invite = None
     try:
         invite = await bot.create_chat_invite_link(
             chat_id, name="Music assistant auto-join"
@@ -637,10 +638,11 @@ async def ensure_assistant_in_group(chat_id: int) -> bool:
         print(f"assistant could not join group {chat_id}: {repr(e)[:240]}", flush=True)
         return False
     finally:
-        try:
-            await bot.revoke_chat_invite_link(chat_id, invite.invite_link)
-        except Exception:
-            pass
+        if invite is not None:
+            try:
+                await bot.revoke_chat_invite_link(chat_id, invite.invite_link)
+            except Exception as revoke_error:
+                print(f"temporary invite cleanup failed: {repr(revoke_error)[:120]}", flush=True)
 
 
 @bot.on_chat_member_updated()
