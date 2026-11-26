@@ -229,7 +229,7 @@ def _youtube(target: str) -> dict:
     # Search results must pass the same title/variant checks as other sources.
     # Direct user-provided YouTube links are intentionally resolved as requested.
     search_query = None
-    m = re.match(r"ytsearch\\d*:(.*)", target, re.I)
+    m = re.match(r"ytsearch\d*:(.*)", target, re.I)
     if m:
         search_query = m.group(1).strip()
     for a in YT_ATTEMPTS:
