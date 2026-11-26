@@ -9,8 +9,9 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg gcc libc6-dev ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Node 20: yt-dlp needs a JavaScript runtime to solve YouTube's challenges
-COPY --from=node:20-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+# Node 22+: supported JavaScript runtime for yt-dlp's YouTube challenge solver
+COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+RUN node --version
 
 WORKDIR /app
 COPY requirements.txt .
