@@ -65,16 +65,32 @@ def get_json(url: str, timeout: float = HTTP_TIMEOUT):
 
 
 def playable(url: str, headers: dict | None = None) -> bool:
-    """Does this stream URL actually answer? (a dead/expired/blocked URL would give silent audio)"""
+    """Verify that a URL returns readable media bytes, not just an HTTP response."""
     h = dict(headers or {})
     h.pop("Accept-Encoding", None)
-    h["Range"] = "bytes=0-2047"
+    h["Range"] = "bytes=0-4095"
     try:
         with _open(url, h) as r:
-            r.read(1)
-            return 200 <= r.status < 400
-    except urllib.error.HTTPError as e:
-        return e.code == 416
+            # A range request may be honoured (206) or ignored (200). Other statuses
+            # are not evidence of a usable stream; in particular, 416 is not playable.
+            if r.status not in (200, 206):
+                return False
+            content_type = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if content_type in {"text/html", "application/json", "text/json", "application/xml"}:
+                return False
+            chunk = r.read(4096)
+            if not chunk:
+                return False
+            probe = chunk.lstrip().lower()
+            if probe.startswith((b"<!doctype html", b"<html", b"{", b"[{")):
+                return False
+            # Some providers label HLS manifests as text/plain; accept them only
+            # when the body is actually an HLS playlist.
+            if content_type == "text/plain" and not probe.startswith(b"#extm3u"):
+                return False
+            return True
+    except urllib.error.HTTPError:
+        return False
     except Exception:
         return False
 
@@ -85,14 +101,8 @@ def _finish(info: dict) -> dict:
     headers = info.get("headers") or {}
     if not playable(info["url"], headers):
         raise RuntimeError(f"{info.get('source')}: stream not reachable")
-    if len(headers) > 1:
-        items = list(headers.items())
-        first_name, first_value = items[0]
-        info["headers"] = {
-            first_name: first_value + "".join(
-                f"\r\n{name}: {value}" for name, value in items[1:]
-            ) + "\r\n"
-        }
+    # MediaStream expects a mapping of individual HTTP header names to values.
+    # Keep them separate: folding Referer/Accept into User-Agent creates one invalid header.
     return info
 
 
