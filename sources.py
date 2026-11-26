@@ -356,16 +356,43 @@ def _jamendo(q: str) -> dict:
 
 
 def _saavn(q: str) -> dict:
-    base = os.environ["SAAVN_API"].rstrip("/")
-    d = get_json(f"{base}/search/songs?query={urllib.parse.quote(q)}&limit=5")
-    for r in (d.get("data") or {}).get("results") or []:
-        dl = [x for x in (r.get("downloadUrl") or []) if x.get("url")]
-        names = ", ".join(a.get("name", "") for a in ((r.get("artists") or {}).get("primary") or []))
-        if (dl and _relevant(q, r.get("name", ""), names)
-                and not _variant_unwanted(q, r.get("name", ""))):
-            return _finish({"title": r.get("name") or "Unknown", "url": dl[-1]["url"], "page": r.get("url", ""),
-                            "duration": int(r.get("duration") or 0), "artist": names, "headers": {}, "source": "saavn"})
-    raise NotFound("saavn: no relevant result")
+    # Public JioSaavn-compatible API; SAAVN_API can override the host if needed.
+    base = os.environ.get("SAAVN_API", "https://jio.shnwaz.dev").rstrip("/")
+    d = get_json(
+        f"{base}/api/search/songs?query={urllib.parse.quote(q)}&limit=10"
+    )
+    results = (d.get("data") or {}).get("results") or []
+    candidates = []
+    for r in results:
+        name = r.get("name") or r.get("title") or ""
+        primary = ((r.get("artists") or {}).get("primary") or [])
+        names = ", ".join(a.get("name", "") for a in primary if a.get("name"))
+        if not name or not _relevant(q, name, names) or _variant_unwanted(q, name):
+            continue
+        downloads = [x for x in (r.get("downloadUrl") or []) if x.get("url")]
+        if not downloads:
+            continue
+        # Prefer the highest declared quality, not merely the last array entry.
+        def quality(item):
+            match = re.search(r"(\d+)", str(item.get("quality") or ""))
+            return int(match.group(1)) if match else 0
+        best = max(downloads, key=quality)
+        candidates.append(( _match_score(q, name, names), r, names, best ))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    for _, r, names, best in candidates:
+        try:
+            return _finish({
+                "title": r.get("name") or r.get("title") or "Unknown",
+                "url": best["url"],
+                "page": r.get("url") or "",
+                "duration": int(r.get("duration") or 0),
+                "artist": names,
+                "headers": {},
+                "source": "saavn",
+            })
+        except Exception as e:
+            log("saavn candidate failed:", str(e)[:120])
+    raise NotFound("saavn: no relevant playable result")
 
 
 # ───────────────────────── registry ─────────────────────────
@@ -390,9 +417,9 @@ class Source:
 def _build() -> list[Source]:
     # YouTube is deliberately disabled by default. Enable only with ENABLE_YOUTUBE=1.
     s = []
-    if os.environ.get("SAAVN_API"):
-        s.append(Source("saavn", _saavn))
-    s.extend([Source("soundcloud", _soundcloud), Source("audius", _audius)])
+    # JioSaavn is the primary source. The public API needs no user credentials.
+    s.append(Source("saavn", _saavn))
+    s.extend([Source("audius", _audius), Source("soundcloud", _soundcloud)])
     if os.environ.get("JAMENDO_CLIENT_ID"):
         s.append(Source("jamendo", _jamendo))
     if os.environ.get("ENABLE_YOUTUBE", "0").strip() == "1":
