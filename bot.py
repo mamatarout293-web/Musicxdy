@@ -268,10 +268,9 @@ async def start_stream(chat_id: int, t: Track):
         video_flags=MediaStream.Flags.IGNORE,
         ffmpeg_parameters=t.ffmpeg_parameters,
     )
-    try:
-        stream = MediaStream(t.url, headers=t.headers, **kw)  # YouTube links need their request headers
-    except TypeError:
-        stream = MediaStream(t.url, **kw)
+    # Preserve provider headers; silently dropping Referer/User-Agent can turn a valid
+    # stream into an HTTP error or an apparently silent playback.
+    stream = MediaStream(t.url, headers=t.headers, **kw)
     try:
         await calls.play(chat_id, stream)
         unmuted = await calls.unmute(chat_id)
