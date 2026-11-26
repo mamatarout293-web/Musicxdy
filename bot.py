@@ -607,7 +607,7 @@ async def watchdog():
 
 
 async def ensure_assistant_in_group(chat_id: int) -> bool:
-    """Join the assistant user account to the group using an invite link exported by the bot."""
+    """Join the assistant user account using a temporary invite link created by the bot."""
     try:
         await assistant.get_chat(chat_id)
         return True
@@ -619,11 +619,18 @@ async def ensure_assistant_in_group(chat_id: int) -> bool:
             chat_id, name="Music assistant auto-join"
         )
         await assistant.join_chat(invite.invite_link)
+        # Confirm membership; join-request-only groups must not be treated as joined.
+        await assistant.get_chat(chat_id)
         print(f"assistant joined group {chat_id}", flush=True)
         return True
     except Exception as e:
         print(f"assistant could not join group {chat_id}: {repr(e)[:240]}", flush=True)
         return False
+    finally:
+        try:
+            await bot.revoke_chat_invite_link(chat_id, invite.invite_link)
+        except Exception:
+            pass
 
 
 @bot.on_chat_member_updated()
