@@ -48,8 +48,18 @@ API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SESSION = os.environ["SESSION_STRING"]  # assistant account that joins the voice chat
 
-# in_memory: nothing is written to disk, so restarts/redeploys on Railway never hit a stale session file
-bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, sleep_threshold=60)
+# Every fresh bot login (auth.ImportBotAuthorization) counts toward Telegram's flood limit, and each
+# Railway deploy used to start with a brand-new in-memory session. Keep the bot session on disk
+# when a persistent directory exists (mount a Railway volume at /data, or set BOT_SESSION_DIR) so
+# redeploys and restarts reuse it instead of logging in again.
+_sess_dir = os.environ.get("BOT_SESSION_DIR") or ("/data" if os.path.isdir("/data") else "")
+if _sess_dir and not os.access(_sess_dir, os.W_OK):
+    _sess_dir = ""
+if _sess_dir:
+    bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir=_sess_dir, sleep_threshold=60)
+else:
+    print("No persistent session dir (/data or BOT_SESSION_DIR): bot logs in fresh on every start.", flush=True)
+    bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, sleep_threshold=60)
 assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH, session_string=SESSION,
                    in_memory=True, sleep_threshold=60)
 calls = PyTgCalls(assistant)
