@@ -98,6 +98,17 @@ def playable(url: str, headers: dict | None = None) -> bool:
 def _finish(info: dict) -> dict:
     if not info.get("url"):
         raise RuntimeError("no stream url")
+    # Reject formats explicitly identified as low quality. Unknown metadata is
+    # allowed because some providers do not publish bitrate/sample-rate fields.
+    try:
+        abr = float(info.get("abr") or 0)
+        if abr and abr < 96:
+            raise RuntimeError(f"{info.get('source')}: audio bitrate too low ({abr:.0f} kbps)")
+        asr = int(info.get("asr") or 0)
+        if asr and asr < 32000:
+            raise RuntimeError(f"{info.get('source')}: sample rate too low ({asr} Hz)")
+    except (TypeError, ValueError):
+        pass
     headers = info.get("headers") or {}
     if not playable(info["url"], headers):
         raise RuntimeError(f"{info.get('source')}: stream not reachable")
@@ -220,6 +231,9 @@ def _norm(info: dict, source: str) -> dict:
         "duration": int(info.get("duration") or 0),
         "artist": info.get("artist") or info.get("uploader") or info.get("channel") or "",
         "headers": info.get("http_headers") or {},
+        "abr": info.get("abr"),
+        "asr": info.get("asr"),
+        "acodec": info.get("acodec"),
         "source": source,
     }
 
@@ -451,7 +465,8 @@ def _build() -> list[Source]:
     # YouTube is the primary playback resolver by default. Set ENABLE_YOUTUBE=0 to disable it.
     s = []
     # Spotify is used only to identify the canonical track; it does not provide audio streams.
-    if os.environ.get("ENABLE_YOUTUBE", "1").strip() != "0":
+    youtube_enabled = os.environ.get("ENABLE_YOUTUBE", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if youtube_enabled:
         s.append(Source("youtube", lambda q: _youtube(f"ytsearch10:{q}")))
     s.extend([Source("audius", _audius), Source("soundcloud", _soundcloud)])
     if os.environ.get("JAMENDO_CLIENT_ID"):
