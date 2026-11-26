@@ -1,15 +1,14 @@
 """Multi-source song resolver.
 
-resolve(query) walks a list of sources (YouTube -> SoundCloud -> Piped -> Audius -> ...) and returns the
+resolve(query) walks public sources first (SoundCloud -> Audius -> YouTube -> ...) and returns the
 first one that gives a stream URL that REALLY answers. A source that keeps failing is put on a short
 cooldown so it can't slow down every request, but it is still tried last - the bot never gives up while
 anything might still work.
 
 Env options (all optional):
-  SOURCE_ORDER      e.g. "youtube,soundcloud,piped,audius"   (order / subset of sources)
+  SOURCE_ORDER      e.g. "soundcloud,audius,youtube"   (order / subset of sources)
   SAAVN_API         base URL of a JioSaavn-compatible API (enables the "saavn" source)
   JAMENDO_CLIENT_ID free Jamendo key (enables the "jamendo" source)
-  PIPED_APIS        comma separated Piped API URLs (default: auto-discovered)
   COOKIES_TXT / COOKIES_BASE64   YouTube cookies (default: cookies.txt next to this file)
   RESOLVE_TIMEOUT   max seconds spent on one search (default 55)
 """
@@ -216,67 +215,6 @@ def _soundcloud(q: str) -> dict:
     raise NotFound("soundcloud: no relevant result")
 
 
-_piped_cache = {"apis": [], "t": 0.0}
-PIPED_DEFAULT = ["https://pipedapi.kavin.rocks", "https://pipedapi.adminforge.de", "https://api.piped.private.coffee"]
-
-
-def _piped_apis() -> list[str]:
-    env = os.environ.get("PIPED_APIS", "")
-    if env.strip():
-        return [x.strip().rstrip("/") for x in env.split(",") if x.strip()]
-    if _piped_cache["apis"] and time.time() - _piped_cache["t"] < 3600:
-        return _piped_cache["apis"]
-    apis: list[str] = []
-    try:
-        data = get_json("https://piped-instances.kavin.rocks/")
-        data.sort(key=lambda d: d.get("uptime_24h") or 0, reverse=True)
-        apis = [d["api_url"].rstrip("/") for d in data if d.get("api_url")][:6]
-    except Exception as e:
-        log("piped instance list unavailable:", str(e)[:100])
-    apis = apis or PIPED_DEFAULT
-    _piped_cache.update(apis=apis, t=time.time())
-    return apis
-
-
-def _piped(q: str) -> dict:
-    last: Exception | None = None
-    for api in _piped_apis()[:3]:
-        try:
-            items = []
-            for flt in ("music_songs", "videos"):
-                d = get_json(f"{api}/search?q={urllib.parse.quote(q)}&filter={flt}")
-                items = [i for i in d.get("items", []) if str(i.get("url", "")).startswith("/watch")]
-                if items:
-                    break
-            if not items:
-                raise NotFound("piped: no results")
-            it = items[0]
-            vid = urllib.parse.parse_qs(urllib.parse.urlparse(it["url"]).query)["v"][0]
-            s = get_json(f"{api}/streams/{vid}")
-            audio = [a for a in s.get("audioStreams", []) if a.get("url") and not a.get("videoOnly")]
-            audio.sort(key=lambda a: a.get("bitrate") or 0, reverse=True)
-            for a in audio[:2]:
-                info = {
-                    "title": s.get("title") or it.get("title") or "Unknown",
-                    "url": a["url"],
-                    "page": f"https://www.youtube.com/watch?v={vid}",
-                    "duration": int(s.get("duration") or it.get("duration") or 0),
-                    "artist": s.get("uploader") or it.get("uploaderName") or "",
-                    "headers": {},
-                    "source": "piped",
-                }
-                try:
-                    return _finish(info)
-                except Exception as ex:
-                    last = ex
-            last = last or RuntimeError("piped: no audio stream")
-        except NotFound:
-            raise
-        except Exception as e:
-            last = e
-    raise last or RuntimeError("piped: no instance")
-
-
 _audius_cache = {"hosts": [], "t": 0.0}
 
 
@@ -378,12 +316,12 @@ class Source:
 
 
 def _build() -> list[Source]:
-    s = [Source("youtube", lambda q: _youtube(f"ytsearch1:{q}"))]
+    s = [Source("soundcloud", _soundcloud), Source("audius", _audius)]
     if os.environ.get("SAAVN_API"):
         s.append(Source("saavn", _saavn))
-    s += [Source("soundcloud", _soundcloud), Source("audius", _audius), Source("piped", _piped)]
     if os.environ.get("JAMENDO_CLIENT_ID"):
         s.append(Source("jamendo", _jamendo))
+    s.append(Source("youtube", lambda q: _youtube(f"ytsearch1:{q}")))
     order = [x.strip() for x in os.environ.get("SOURCE_ORDER", "").split(",") if x.strip()]
     if order:
         by = {x.name: x for x in s}

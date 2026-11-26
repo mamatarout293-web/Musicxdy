@@ -43,5 +43,13 @@ class AudiusTests(unittest.TestCase):
         self.assertEqual(finish.call_count, 2)
 
 
+class SourceOrderTests(unittest.TestCase):
+    def test_public_sources_precede_youtube_and_piped_is_not_registered(self):
+        with patch.dict(sources.os.environ, {}, clear=True):
+            names = [source.name for source in sources._build()]
+
+        self.assertEqual(names, ["soundcloud", "audius", "youtube"])
+
+
 if __name__ == "__main__":
     unittest.main()

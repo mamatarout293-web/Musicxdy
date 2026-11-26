@@ -32,13 +32,14 @@ Copy `.env.example` to `.env`, fill it in, then `python main.py`.
 - yt-dlp is updated on every start (YouTube changes often).
 
 ## Music sources (tried in this order)
-YouTube (4 client methods) → SoundCloud → Audius → Piped.
-Audius tries multiple discovery hosts and matching streamable results before giving up. Optional:
-`SAAVN_API`, `JAMENDO_CLIENT_ID`. Change the order with `SOURCE_ORDER`.
+SoundCloud → Audius → optional Saavn/Jamendo → YouTube (last resort).
+Audius tries multiple discovery hosts and matching streamable results before giving up. Piped was
+removed because its instances are unreliable. Change the order with `SOURCE_ORDER`.
 
 The bot can only play streams a provider makes publicly available to it. It cannot guarantee every
 song or subscriber/premium quality, and it does not bypass login, DRM, or provider bot restrictions.
-For a complete licensed catalog, connect a provider that grants your deployment playback rights.
+YouTube cookies do not guarantee access from Railway. For a complete licensed catalog, connect a
+provider that grants your deployment playback rights.
 
 ## Files
 bot.py · sources.py · main.py · config.py · Dockerfile · railway.json · Procfile · requirements.txt · .env.example
