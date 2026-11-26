@@ -480,6 +480,14 @@ async def play(_, m: Message):
     if not query:
         return await m.reply_text("Usage: /mxstartplay song name or link")
 
+    # The assistant must be a group member before it can join that group's voice chat.
+    if not await ensure_assistant_in_group(m.chat.id):
+        return await m.reply_text(
+            "I couldn't add the assistant account to this group. "
+            "Please make the music bot an admin so it can create an invite link, "
+            "then try /mxplay again."
+        )
+
     status = await m.reply_text("Searching…")
     try:
         info = await asyncio.to_thread(sources.resolve, query)
@@ -596,6 +604,49 @@ async def watchdog():
             if fails >= 3:
                 print("watchdog: restarting the bot", flush=True)
                 os._exit(1)
+
+
+async def ensure_assistant_in_group(chat_id: int) -> bool:
+    """Join the assistant user account to the group using an invite link exported by the bot."""
+    try:
+        await assistant.get_chat(chat_id)
+        return True
+    except Exception as lookup_error:
+        print(f"assistant is not in group {chat_id}: {type(lookup_error).__name__}", flush=True)
+
+    try:
+        invite_link = await bot.export_chat_invite_link(chat_id)
+        await assistant.join_chat(invite_link)
+        print(f"assistant joined group {chat_id}", flush=True)
+        return True
+    except Exception as e:
+        print(f"assistant could not join group {chat_id}: {repr(e)[:240]}", flush=True)
+        return False
+
+
+@bot.on_chat_member_updated()
+async def on_bot_group_membership(_, update):
+    """When this bot is added to a group, invite the assistant account into it first."""
+    try:
+        me = await bot.get_me()
+        member = getattr(update, "new_chat_member", None)
+        user = getattr(member, "user", None)
+        if not user or user.id != me.id:
+            return
+        status = getattr(member, "status", "")
+        if status not in ("member", "administrator"):
+            return
+        chat = update.chat
+        if getattr(chat, "type", None) not in ("group", "supergroup"):
+            return
+        if not await ensure_assistant_in_group(chat.id):
+            print(
+                f"assistant auto-join needs the bot to be an admin in group {chat.id} "
+                "so it can export an invite link",
+                flush=True,
+            )
+    except Exception as e:
+        print("automatic assistant group join failed:", repr(e)[:240], flush=True)
 
 
 async def start_with_floodwait(client, name):
