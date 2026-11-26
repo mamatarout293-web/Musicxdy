@@ -14,12 +14,12 @@ API_HASH=...
 BOT_TOKEN=...
 SESSION_STRING=...
 SAAVN_API=https://your-jiosaavn-api.example.com/api
-COOKIES_BASE64=... (optional; YouTube is disabled by default)
+COOKIES_BASE64=... (optional; only if YouTube asks for login)
+COOKIES_FROM_BROWSER=auto (optional; imports an existing browser profile when available)
 ```
 3. Railway redeploys. Open **Deployments → View logs**; you should see `starting bot.py`.
 
-`COOKIES_BASE64` is optional (YouTube cookies). Create it from your cookies.txt with:
-`base64 -w0 cookies.txt` (Linux) or `base64 -i cookies.txt` (Mac).
+YouTube authentication is deployment-dependent. The resolver reads `COOKIES_BASE64`, `COOKIES_TXT`, or a local `cookies.txt`. It can also try importing cookies from an already logged-in browser profile (`COOKIES_FROM_BROWSER=auto`, or e.g. `chrome:Default`). This only imports an existing session; it cannot create a Google login or manufacture valid cookies. Railway containers normally have no logged-in browser profile, so provide a fresh Netscape-format cookie export through Railway Variables when YouTube requires sign-in. Never commit or share cookie contents.
 
 Variables set in Railway always win over a local `.env`.
 
