@@ -61,6 +61,7 @@ class Track:
     task: object = None
     source: str = ""        # which source produced the stream (youtube, soundcloud, ...)
     query: str = ""         # what the user asked for, used to find the song again elsewhere
+    ffmpeg_parameters: str | None = None
     resolved_at: float = 0.0
     retries: int = 0
     bad: set = field(default_factory=set)  # sources that already failed for this track
@@ -241,6 +242,7 @@ async def start_stream(chat_id: int, t: Track):
         audio_parameters=AudioQuality.HIGH,  # 48 kHz stereo
         audio_flags=MediaStream.Flags.REQUIRED,
         video_flags=MediaStream.Flags.IGNORE,
+        ffmpeg_parameters=t.ffmpeg_parameters,
     )
     try:
         stream = MediaStream(t.url, headers=t.headers, **kw)  # YouTube links need their request headers
@@ -456,6 +458,33 @@ async def play(_, m: Message):
         await status.delete()
         await api("sendMessage", {"chat_id": m.chat.id, "parse_mode": "HTML",
                                   "text": f"{pe('queue')} <b>QUEUED #{len(q) - 1}</b>\n\n<b>{html.escape(t.title)}</b>\n{pe('user')} {html.escape(t.by)}"})
+
+
+@bot.on_message(filters.command("testaudio") & filters.group)
+async def test_audio(_, m: Message):
+    if queues.get(m.chat.id):
+        return await m.reply_text("Stop current playback with /stop, then run /testaudio.")
+    status = await m.reply_text("Starting an 8-second audio test…")
+    t = Track(
+        title="440 Hz audio test",
+        url="sine=frequency=440:duration=8",
+        page="",
+        duration=8,
+        by=m.from_user.first_name if m.from_user else "Unknown",
+        source="test tone",
+        ffmpeg_parameters="--audio --start -f lavfi",
+        resolved_at=time.time(),
+    )
+    q = queues.setdefault(m.chat.id, [])
+    q.append(t)
+    try:
+        await start_stream(m.chat.id, t)
+        await status.delete()
+        await announce(m.chat.id, t)
+    except Exception as e:
+        q.clear()
+        print("audio test failed:", repr(e)[:200], flush=True)
+        await status.edit_text("The audio test could not start. Check the voice chat and Railway logs.")
 
 
 def _cmd(name: str, action: str):

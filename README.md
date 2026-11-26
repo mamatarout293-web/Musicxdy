@@ -36,6 +36,9 @@ SoundCloud → Audius → optional Saavn/Jamendo → YouTube (last resort).
 Audius tries multiple discovery hosts and matching streamable results before giving up. Piped was
 removed because its instances are unreliable. Change the order with `SOURCE_ORDER`.
 
+Use `/testaudio` in a group with an active voice chat (stop current playback first) to play a short
+built-in tone and isolate Telegram voice output from external music sources.
+
 The bot can only play streams a provider makes publicly available to it. It cannot guarantee every
 song or subscriber/premium quality, and it does not bypass login, DRM, or provider bot restrictions.
 YouTube cookies do not guarantee access from Railway. For a complete licensed catalog, connect a
