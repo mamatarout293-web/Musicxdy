@@ -104,12 +104,42 @@ def _tokens(s: str) -> set[str]:
 
 
 def _relevant(query: str, title: str, artist: str = "") -> bool:
-    """Cheap guard so a fallback source doesn't play a totally different song."""
+    """Reject weak matches; artist/title tokens must substantially match the request."""
     q = _tokens(query)
     if not q:
         return True
     have = _tokens(f"{title} {artist}")
-    return len(q & have) / len(q) >= 0.5
+    return len(q & have) / len(q) >= 0.6
+
+
+_VARIANT = re.compile(
+    r"\b(?:mix(?:es)?|remix(?:es)?|mashup|medley|sped\s*up|slowed(?:\s*\+\s*reverb)?|"
+    r"nightcore|8d|karaoke|cover|live|instrumental|bass\s*boosted|extended|dj\s*set|"
+    r"lyrics?\s*video)\b", re.I
+)
+
+
+def _variant_unwanted(query: str, title: str) -> bool:
+    """Avoid mixes/covers when the user asked for the original recording."""
+    if _VARIANT.search(query):
+        return False
+    return bool(_VARIANT.search(title))
+
+
+def _match_score(query: str, title: str, artist: str = "") -> float:
+    q = _tokens(query)
+    t = _tokens(title)
+    a = _tokens(artist)
+    if not q:
+        return 0.0
+    overlap = len(q & (t | a)) / len(q)
+    title_overlap = len(q & t) / len(q)
+    score = overlap * 5 + title_overlap * 2
+    if q == t:
+        score += 5
+    if _variant_unwanted(query, title):
+        score -= 20
+    return score
 
 
 def _prepare_cookies() -> str | None:
@@ -141,7 +171,7 @@ COOKIES = _prepare_cookies()
 
 def _ydl_opts(cookies: bool = True, clients: list[str] | None = None) -> dict:
     o = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[acodec!=none]/best[acodec!=none]/best",
         "js_runtimes": {"deno": {}, "node": {}},
         "remote_components": ["ejs:github"],
         "noplaylist": True,
@@ -209,11 +239,14 @@ def _youtube(target: str) -> dict:
 
 def _soundcloud(q: str) -> dict:
     last: Exception | None = None
-    for e in _ydl_entries(_ydl_opts(cookies=False), f"scsearch3:{q}"):
+    entries = _ydl_entries(_ydl_opts(cookies=False), f"scsearch10:{q}")
+    candidates = sorted(entries, key=lambda e: _match_score(
+        q, e.get("title", ""), e.get("artist") or e.get("uploader", "")), reverse=True)
+    for e in candidates:
         if "preview" in f"{e.get('format_note', '')} {e.get('format_id', '')}".lower():
-            continue  # 30-second Go+ preview, not the song
+            continue
         info = _norm(e, "soundcloud")
-        if not _relevant(q, info["title"], info["artist"]):
+        if not _relevant(q, info["title"], info["artist"]) or _variant_unwanted(q, info["title"]):
             continue
         try:
             return _finish(info)
@@ -325,12 +358,17 @@ class Source:
 
 
 def _build() -> list[Source]:
-    s = [Source("soundcloud", _soundcloud), Source("audius", _audius)]
+    # YouTube is deliberately disabled by default. Enable only with ENABLE_YOUTUBE=1.
+    s = []
     if os.environ.get("SAAVN_API"):
         s.append(Source("saavn", _saavn))
+    s.extend([Source("soundcloud", _soundcloud), Source("audius", _audius)])
     if os.environ.get("JAMENDO_CLIENT_ID"):
         s.append(Source("jamendo", _jamendo))
-    s.append(Source("youtube", lambda q: _youtube(f"ytsearch1:{q}")))
+    if os.environ.get("ENABLE_YOUTUBE", "0").strip() == "1":
+        s.append(Source("youtube", lambda q: _youtube(f"ytsearch10:{q}")))
+    if not s:
+        raise RuntimeError("No music sources enabled")
     order = [x.strip() for x in os.environ.get("SOURCE_ORDER", "").split(",") if x.strip()]
     if order:
         by = {x.name: x for x in s}
