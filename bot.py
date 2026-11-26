@@ -38,8 +38,8 @@ from pyrogram.types import (
 from pytgcalls import PyTgCalls, filters as call_filters
 from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
 
-# Ask PyTgCalls to expose FFmpeg input/decoding diagnostics in Railway logs.
-logging.getLogger('ffmpeg').setLevel(logging.DEBUG)
+# FFmpeg DEBUG output floods the logs (HLS reconnect/playlist lines many times a second).
+logging.getLogger('ffmpeg').setLevel(logging.WARNING)
 
 import sources
 
