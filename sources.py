@@ -1,6 +1,6 @@
 """Multi-source song resolver.
 
-resolve(query) walks a list of sources (YouTube -> SoundCloud -> Audius -> Piped -> ...) and returns the
+resolve(query) walks a list of sources (YouTube -> SoundCloud -> Piped -> Audius -> ...) and returns the
 first one that gives a stream URL that REALLY answers. A source that keeps failing is put on a short
 cooldown so it can't slow down every request, but it is still tried last - the bot never gives up while
 anything might still work.
