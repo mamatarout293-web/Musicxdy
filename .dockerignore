@@ -1,0 +1,14 @@
+.git
+.github
+__pycache__
+*.pyc
+*.session
+*.session-journal
+venv
+.venv
+.env
+.env.*
+cookies.txt
+*.zip
+README.md
+setup.sh

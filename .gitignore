@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+venv/
+.venv/
+.env
+.env.*
+!.env.example
+cookies.txt
+*.zip
