@@ -50,15 +50,17 @@ assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH, session_string
 calls = PyTgCalls(assistant)
 
 BOT_COMMANDS = [
-    BotCommand("play", "Play a song or link"),
-    BotCommand("queue", "Show the song queue"),
-    BotCommand("pause", "Pause playback"),
-    BotCommand("resume", "Resume playback"),
-    BotCommand("skip", "Skip to the next song"),
-    BotCommand("prev", "Play the previous song"),
-    BotCommand("shuffle", "Shuffle upcoming songs"),
-    BotCommand("loop", "Toggle repeat"),
-    BotCommand("stop", "Stop playback and clear the queue"),
+    BotCommand("mxstartplay", "Start playing a song or link"),
+    BotCommand("mxplay", "Play or queue a song"),
+    BotCommand("mxqueue", "Show the music queue"),
+    BotCommand("mxpause", "Pause music"),
+    BotCommand("mxresume", "Resume music"),
+    BotCommand("mxskip", "Skip the current song"),
+    BotCommand("mxprevious", "Play the previous song"),
+    BotCommand("mxshuffle", "Shuffle upcoming songs"),
+    BotCommand("mxloop", "Toggle repeat"),
+    BotCommand("mxstopplay", "Stop music and clear the queue"),
+    BotCommand("mxtestaudio", "Test Telegram voice-chat audio"),
 ]
 
 
@@ -423,13 +425,13 @@ async def on_end(_, update: StreamEnded):
         print("on_end failed:", repr(e)[:200], flush=True)
 
 
-@bot.on_message(filters.command("play") & filters.group)
+@bot.on_message(filters.command(["mxplay", "mxstartplay"]) & filters.group)
 async def play(_, m: Message):
     query = " ".join(m.command[1:]).strip()
     if not query and m.reply_to_message:
         query = (m.reply_to_message.text or "").strip()
     if not query:
-        return await m.reply_text("Usage: /play song name or link")
+        return await m.reply_text("Usage: /mxstartplay song name or link")
 
     status = await m.reply_text("Searching…")
     try:
@@ -478,10 +480,10 @@ async def play(_, m: Message):
                                   "text": f"{pe('queue')} <b>QUEUED #{len(q) - 1}</b>\n\n<b>{html.escape(t.title)}</b>\n{pe('user')} {html.escape(t.by)}"})
 
 
-@bot.on_message(filters.command("testaudio") & filters.group)
+@bot.on_message(filters.command("mxtestaudio") & filters.group)
 async def test_audio(_, m: Message):
     if queues.get(m.chat.id):
-        return await m.reply_text("Stop current playback with /stop, then run /testaudio.")
+        return await m.reply_text("Stop current playback with /mxstopplay, then run /mxtestaudio.")
     status = await m.reply_text("Starting an 8-second audio test…")
     t = Track(
         title="440 Hz audio test",
@@ -516,8 +518,9 @@ def _cmd(name: str, action: str):
         await m.reply_text(text)
 
 
-for _n, _a in (("pause", "pause"), ("resume", "resume"), ("skip", "skip"),
-               ("stop", "stop"), ("prev", "prev"), ("shuffle", "shuffle"), ("loop", "loop")):
+for _n, _a in (("mxpause", "pause"), ("mxresume", "resume"), ("mxskip", "skip"),
+               ("mxstopplay", "stop"), ("mxprevious", "prev"), ("mxshuffle", "shuffle"),
+               ("mxloop", "loop")):
     _cmd(_n, _a)
 
 
@@ -530,7 +533,7 @@ async def buttons(_, cq: CallbackQuery):
     await cq.answer(text)
 
 
-@bot.on_message(filters.command("queue") & filters.group)
+@bot.on_message(filters.command("mxqueue") & filters.group)
 async def show_queue(_, m: Message):
     q = queues.get(m.chat.id)
     if not q:
