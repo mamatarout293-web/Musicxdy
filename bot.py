@@ -283,6 +283,48 @@ async def start_stream(chat_id: int, t: Track):
     t.paused_at = 0.0
 
 
+def _is_call_setup_error(error: Exception) -> bool:
+    """Do not switch audio providers for Telegram voice-chat permission/state errors."""
+    name = type(error).__name__.lower()
+    message = str(error).lower()
+    known_types = (
+        "groupcall", "chatadminrequired", "usernotparticipant",
+        "peeridinvalid", "channelprivate", "userbannedinchannel",
+    )
+    known_messages = (
+        "voice chat is not active", "group call is not active",
+        "not a participant", "chat admin required", "peer id invalid",
+    )
+    return any(token in name for token in known_types) or any(
+        token in message for token in known_messages
+    )
+
+
+async def start_with_fallback(chat_id: int, t: Track):
+    """Start this exact requested track; on media failure, retry other providers only."""
+    attempts = max(1, len(sources.SOURCES))
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            await ensure_fresh(t)
+            await start_stream(chat_id, t)
+            return
+        except Exception as e:
+            if _is_call_setup_error(e):
+                raise
+            last_error = e
+            if t.source:
+                t.bad.add(t.source)
+            if attempt + 1 >= attempts:
+                break
+            try:
+                await reresolve(t)
+            except Exception as resolve_error:
+                last_error = resolve_error
+                break
+    raise RuntimeError(f"all available audio sources failed: {last_error}") from last_error
+
+
 async def announce(chat_id: int, t: Track):
     res = await api("sendMessage", {
         "chat_id": chat_id, "text": card(t), "parse_mode": "HTML",
@@ -318,8 +360,7 @@ async def play_next(chat_id: int, force: bool = False):
     q = queues.get(chat_id, [])
     if q and loop.get(chat_id) and not force:
         try:
-            await ensure_fresh(q[0])
-            await start_stream(chat_id, q[0])  # replay same track, same card
+            await start_with_fallback(chat_id, q[0])  # replay same track, same card
             return
         except Exception as e:
             print("loop replay failed:", repr(e)[:200], flush=True)
@@ -334,8 +375,7 @@ async def play_next(chat_id: int, force: bool = False):
             await leave(chat_id)
             return
         try:
-            await ensure_fresh(q[0])
-            await start_stream(chat_id, q[0])
+            await start_with_fallback(chat_id, q[0])
             await announce(chat_id, q[0])
             return
         except Exception as e:
@@ -355,8 +395,7 @@ async def handle_end(chat_id: int):
         t.bad.add(t.source)
         print(f"stream died right away ({t.source}), trying another source (try {t.retries})", flush=True)
         try:
-            await reresolve(t)
-            await start_stream(chat_id, t)
+            await start_with_fallback(chat_id, t)
             return
         except Exception as e:
             print("no other source worked:", repr(e)[:200], flush=True)
@@ -392,7 +431,7 @@ async def act(chat_id: int, action: str) -> str:
             return "No previous song."
         finish(cur)
         q.insert(0, h.pop())
-        await start_stream(chat_id, q[0])
+        await start_with_fallback(chat_id, q[0])
         await announce(chat_id, q[0])
         return "⏮ Previous"
     if action == "shuffle":
@@ -463,17 +502,7 @@ async def play(_, m: Message):
 
     if len(q) == 1:
         try:
-            try:
-                await start_stream(m.chat.id, t)
-            except Exception as e:
-                call_problem = any(w in str(e).lower() + type(e).__name__.lower()
-                                   for w in ("group", "call", "voice", "peer", "participant", "admin", "forbidden"))
-                if call_problem:
-                    raise
-                print("start failed, trying another source:", repr(e)[:200], flush=True)
-                t.bad.add(t.source)
-                await reresolve(t)
-                await start_stream(m.chat.id, t)
+            await start_with_fallback(m.chat.id, t)
         except Exception as e:
             q.clear()
             return await status.edit_text(f"Couldn't start playback. Make sure a voice chat is open and the assistant is in the group.\n{e}")
