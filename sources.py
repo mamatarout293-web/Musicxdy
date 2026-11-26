@@ -1,15 +1,15 @@
 """Multi-source song resolver.
 
-resolve(query) walks public sources first (SoundCloud -> Audius -> YouTube -> ...) and returns the
-first one that gives a stream URL that REALLY answers. A source that keeps failing is put on a short
-cooldown so it can't slow down every request, but it is still tried last - the bot never gives up while
-anything might still work.
+YouTube is the primary search/playback resolver, followed by Audius and SoundCloud.
+Each candidate is checked for relevance and unwanted alternate versions before playback.
+Sources that fail are temporarily cooled down and tried after healthy sources.
 
 Env options (all optional):
-  SOURCE_ORDER      e.g. "soundcloud,audius,youtube"   (order / subset of sources)
+  SOURCE_ORDER      e.g. "youtube,audius,soundcloud"   (order / subset of sources)
   SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET  optional Spotify catalog lookup credentials
   JAMENDO_CLIENT_ID free Jamendo key (enables the "jamendo" source)
-  COOKIES_TXT / COOKIES_BASE64   YouTube cookies (default: cookies.txt next to this file)
+  COOKIES_TXT / COOKIES_BASE64   optional YouTube cookies (default: cookies.txt next to this file)
+  ENABLE_YOUTUBE                  set to 0 to disable YouTube (enabled by default)
   RESOLVE_TIMEOUT   max seconds spent on one search (default 55)
 """
 from __future__ import annotations
@@ -266,9 +266,11 @@ def _youtube(target: str) -> dict:
                 except Exception as e:
                     last = e
             if search_query:
-                raise NotFound("youtube: no acceptable search result")
-        except NotFound:
-            raise
+                last = NotFound("youtube: no acceptable search result")
+                continue
+        except NotFound as e:
+            last = e
+            continue
         except Exception as e:
             last = e
             log("youtube attempt failed:", str(e)[:160])
@@ -446,14 +448,14 @@ class Source:
 
 
 def _build() -> list[Source]:
-    # YouTube is deliberately disabled by default. Enable only with ENABLE_YOUTUBE=1.
+    # YouTube is the primary playback resolver by default. Set ENABLE_YOUTUBE=0 to disable it.
     s = []
-    # Spotify is used only to identify the canonical track; it does not provide full-track streams.
+    # Spotify is used only to identify the canonical track; it does not provide audio streams.
+    if os.environ.get("ENABLE_YOUTUBE", "1").strip() != "0":
+        s.append(Source("youtube", lambda q: _youtube(f"ytsearch10:{q}")))
     s.extend([Source("audius", _audius), Source("soundcloud", _soundcloud)])
     if os.environ.get("JAMENDO_CLIENT_ID"):
         s.append(Source("jamendo", _jamendo))
-    if os.environ.get("ENABLE_YOUTUBE", "0").strip() == "1":
-        s.append(Source("youtube", lambda q: _youtube(f"ytsearch10:{q}")))
     if not s:
         raise RuntimeError("No music sources enabled")
     order = [x.strip() for x in os.environ.get("SOURCE_ORDER", "").split(",") if x.strip()]
