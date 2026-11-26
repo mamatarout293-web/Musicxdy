@@ -484,7 +484,7 @@ async def play(_, m: Message):
     if not await ensure_assistant_in_group(m.chat.id):
         return await m.reply_text(
             "I couldn't add the assistant account to this group. "
-            "Please make the music bot an admin so it can create an invite link, "
+            "Please make the music bot an admin with permission to invite users, "
             "then try /mxplay again."
         )
 
@@ -615,8 +615,10 @@ async def ensure_assistant_in_group(chat_id: int) -> bool:
         print(f"assistant is not in group {chat_id}: {type(lookup_error).__name__}", flush=True)
 
     try:
-        invite_link = await bot.export_chat_invite_link(chat_id)
-        await assistant.join_chat(invite_link)
+        invite = await bot.create_chat_invite_link(
+            chat_id, name="Music assistant auto-join"
+        )
+        await assistant.join_chat(invite.invite_link)
         print(f"assistant joined group {chat_id}", flush=True)
         return True
     except Exception as e:
@@ -645,7 +647,7 @@ async def on_bot_group_membership(_, update):
         if not await ensure_assistant_in_group(chat.id):
             print(
                 f"assistant auto-join needs the bot to be an admin in group {chat.id} "
-                "so it can export an invite link",
+                "so it can create an invite link",
                 flush=True,
             )
     except Exception as e:
