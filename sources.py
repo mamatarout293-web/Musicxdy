@@ -117,7 +117,7 @@ def _finish(info: dict) -> dict:
     return info
 
 
-_STOP = {"official", "video", "audio", "lyrics", "lyric", "song", "full", "new", "hd", "the", "a", "of", "ft", "feat", "and"}
+_STOP = {"official", "video", "audio", "lyrics", "lyric", "song", "full", "new", "hd", "the", "a", "of", "ft", "feat", "and", "by", "original", "version"}
 
 
 def _tokens(s: str) -> set[str]:
@@ -160,7 +160,7 @@ def _match_score(query: str, title: str, artist: str = "") -> float:
     score = overlap * 5 + title_overlap * 2
     if q == t:
         score += 5
-    if _variant_unwanted(query, title):
+    if _variant_unwanted(query, title, artist):
         score -= 20
     return score
 
