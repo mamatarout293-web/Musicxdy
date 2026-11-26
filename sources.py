@@ -374,7 +374,7 @@ def _saavn(q: str) -> dict:
             continue
         # Prefer the highest declared quality, not merely the last array entry.
         def quality(item):
-            match = re.search(r"(\\d+)", str(item.get("quality") or ""))
+            match = re.search(r"(\d+)", str(item.get("quality") or ""))
             return int(match.group(1)) if match else 0
         best = max(downloads, key=quality)
         candidates.append(( _match_score(q, name, names), r, names, best ))
