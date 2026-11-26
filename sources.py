@@ -1,12 +1,11 @@
 """Multi-source song resolver.
 
-resolve(query) walks public sources first (SoundCloud -> Audius -> YouTube -> ...) and returns the
-first one that gives a stream URL that REALLY answers. A source that keeps failing is put on a short
-cooldown so it can't slow down every request, but it is still tried last - the bot never gives up while
-anything might still work.
+resolve(query) searches healthy sources concurrently and returns the first one that gives a stream URL
+that REALLY answers. A source that keeps failing is put on a short cooldown; it is only tried after
+healthy sources fail, so it can't slow down every request.
 
 Env options (all optional):
-  SOURCE_ORDER      e.g. "soundcloud,audius,youtube"   (order / subset of sources)
+  SOURCE_ORDER      e.g. "soundcloud,audius,youtube"   (subset / tie-break preference)
   SAAVN_API         base URL of a JioSaavn-compatible API (enables the "saavn" source)
   JAMENDO_CLIENT_ID free Jamendo key (enables the "jamendo" source)
   COOKIES_TXT / COOKIES_BASE64   YouTube cookies (default: cookies.txt next to this file)
@@ -25,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
 from yt_dlp import YoutubeDL
 
@@ -339,6 +339,21 @@ def _build() -> list[Source]:
 
 
 SOURCES = _build()
+_RESOLVER_POOL = ThreadPoolExecutor(max_workers=max(1, len(SOURCES)))
+
+
+def _try_source(source: Source, query: str):
+    try:
+        info = source.fn(query)
+        source.good()
+        return info, None
+    except NotFound as e:
+        return None, e
+    except Exception as e:
+        source.bad()
+        log(f"{source.name} failed (cooldown {int(source.dead_until - time.time())}s):",
+            str(e)[:160])
+        return None, e
 
 
 # ───────────────────────── URLs ─────────────────────────
@@ -406,20 +421,44 @@ def resolve(query: str, skip=()) -> dict:
         query = hint
 
     ordered = [s for s in SOURCES if s.name not in skip]
-    ordered.sort(key=lambda s: not s.alive)  # healthy sources first, cooling-down ones as last resort
-    for s in ordered:
-        if time.time() - t0 > DEADLINE:
-            errors.append("timeout")
-            break
-        try:
-            info = s.fn(query)
-            s.good()
-            log(f"'{query[:50]}' -> {s.name}")
+    healthy = [s for s in ordered if s.alive]
+    cooling = [s for s in ordered if not s.alive]
+
+    def run_group(group: list[Source]) -> dict | None:
+        futures: dict[Future, Source] = {
+            _RESOLVER_POOL.submit(_try_source, s, query): s for s in group
+        }
+        source_order = {s: i for i, s in enumerate(group)}
+        while futures:
+            remaining = DEADLINE - (time.time() - t0)
+            if remaining <= 0:
+                errors.append("timeout")
+                break
+            done, _ = wait(futures, timeout=remaining, return_when=FIRST_COMPLETED)
+            if not done:
+                errors.append("timeout")
+                break
+            for future in sorted(done, key=lambda f: source_order[futures[f]]):
+                source = futures.pop(future)
+                info, error = future.result()
+                if error is None:
+                    log(f"'{query[:50]}' -> {source.name}")
+                    for pending in futures:
+                        pending.cancel()
+                    return info
+                if isinstance(error, NotFound):
+                    errors.append(str(error))
+                else:
+                    errors.append(f"{source.name}: {str(error)[:100]}")
+        for future in futures:
+            future.cancel()
+        return None
+
+    info = run_group(healthy)
+    if info:
+        return info
+    if time.time() - t0 <= DEADLINE:
+        info = run_group(cooling)
+        if info:
             return info
-        except NotFound as e:
-            errors.append(str(e))
-        except Exception as e:
-            s.bad()
-            errors.append(f"{s.name}: {str(e)[:100]}")
-            log(f"{s.name} failed (cooldown {int(s.dead_until - time.time())}s):", str(e)[:160])
     raise Unavailable(errors)

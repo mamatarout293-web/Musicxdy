@@ -31,13 +31,15 @@ Copy `.env.example` to `.env`, fill it in, then `python main.py`.
 - A song that can't be played is skipped; a dead stream is retried from another source.
 - yt-dlp is updated on every start (YouTube changes often).
 
-## Music sources (tried in this order)
-SoundCloud → Audius → optional Saavn/Jamendo → YouTube (last resort).
-Audius tries multiple discovery hosts and matching streamable results before giving up. Piped was
-removed because its instances are unreliable. Change the order with `SOURCE_ORDER`.
+## Music sources
+SoundCloud, Audius, optional Saavn/Jamendo, and YouTube are searched concurrently; the first playable
+result starts playback. Providers on cooldown are only tried after healthy providers fail. Change the
+source set with `SOURCE_ORDER`; its order breaks ties between simultaneous results. Audius tries
+multiple discovery hosts and matching streamable results before giving up. Piped was removed because
+its instances are unreliable.
 
-Use `/testaudio` in a group with an active voice chat (stop current playback first) to play a short
-built-in tone and isolate Telegram voice output from external music sources.
+Use `/mxplayforce <song>` to replace the current track and clear the queue after the requested song is
+found.
 
 The bot can only play streams a provider makes publicly available to it. It cannot guarantee every
 song or subscriber/premium quality, and it does not bypass login, DRM, or provider bot restrictions.

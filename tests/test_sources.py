@@ -1,7 +1,34 @@
+import threading
 import unittest
 from unittest.mock import patch
 
 import sources
+
+
+class ParallelResolveTests(unittest.TestCase):
+    def test_returns_fast_source_without_waiting_for_slow_source(self):
+        slow_started = threading.Event()
+        release_slow = threading.Event()
+
+        def slow(_query):
+            slow_started.set()
+            release_slow.wait(2)
+            return {"source": "slow"}
+
+        def fast(_query):
+            slow_started.wait(1)
+            return fast_result
+
+        fast_result = {"source": "fast"}
+        providers = [sources.Source("slow", slow), sources.Source("fast", fast)]
+        try:
+            with patch.object(sources, "SOURCES", providers), patch.object(sources, "DEADLINE", 3):
+                result = sources.resolve("a song")
+
+            self.assertTrue(slow_started.is_set())
+            self.assertIs(result, fast_result)
+        finally:
+            release_slow.set()
 
 
 class AudiusTests(unittest.TestCase):
