@@ -566,8 +566,20 @@ async def watchdog():
                 os._exit(1)
 
 
+async def start_with_floodwait(client, name):
+    """Start a client, sleeping out Telegram's FloodWait instead of crashing (restarts extend the ban)."""
+    while True:
+        try:
+            await client.start()
+            return
+        except FloodWait as e:
+            wait_seconds = max(int(getattr(e, "value", 0)), 1) + 5
+            print(f"Telegram FloodWait starting {name}; waiting {wait_seconds}s.", flush=True)
+            await asyncio.sleep(wait_seconds)
+
+
 async def main():
-    await bot.start()
+    await start_with_floodwait(bot, "bot")
     if not await bot.set_bot_commands(
         BOT_COMMANDS,
         scope=BotCommandScopeAllGroupChats(),
