@@ -296,7 +296,8 @@ def _audius(q: str) -> dict:
                 track_key = (host, track_id)
                 artist = (t.get("user") or {}).get("name", "")
                 if (not track_id or track_key in seen or t.get("is_streamable") is False
-                        or not _relevant(q, t.get("title", ""), artist)):
+                        or not _relevant(q, t.get("title", ""), artist)
+                        or _variant_unwanted(q, t.get("title", ""))):
                     continue
                 seen.add(track_key)
                 try:
@@ -332,7 +333,8 @@ def _saavn(q: str) -> dict:
     for r in (d.get("data") or {}).get("results") or []:
         dl = [x for x in (r.get("downloadUrl") or []) if x.get("url")]
         names = ", ".join(a.get("name", "") for a in ((r.get("artists") or {}).get("primary") or []))
-        if dl and _relevant(q, r.get("name", ""), names):
+        if (dl and _relevant(q, r.get("name", ""), names)
+                and not _variant_unwanted(q, r.get("name", ""))):
             return _finish({"title": r.get("name") or "Unknown", "url": dl[-1]["url"], "page": r.get("url", ""),
                             "duration": int(r.get("duration") or 0), "artist": names, "headers": {}, "source": "saavn"})
     raise NotFound("saavn: no relevant result")
