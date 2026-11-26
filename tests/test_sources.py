@@ -44,16 +44,16 @@ class AudiusTests(unittest.TestCase):
 
 
 class SourceOrderTests(unittest.TestCase):
-    def test_public_sources_precede_youtube_and_piped_is_not_registered(self):
+    def test_only_public_audio_sources_are_enabled_by_default(self):
         with patch.dict(sources.os.environ, {}, clear=True):
             names = [source.name for source in sources._build()]
 
-        self.assertEqual(names, ["soundcloud", "audius", "youtube"])
+        self.assertEqual(names, ["audius", "soundcloud"])
 
 
 class StreamHeaderTests(unittest.TestCase):
     @patch("sources.playable", return_value=True)
-    def test_finish_combines_headers_for_ffmpeg(self, playable):
+    def test_finish_preserves_individual_ffmpeg_headers(self, playable):
         headers = {
             "User-Agent": "MusicBot/1.0",
             "Accept": "*/*",
@@ -64,9 +64,45 @@ class StreamHeaderTests(unittest.TestCase):
         result = sources._finish(info)
 
         playable.assert_called_once_with(info["url"], headers)
-        self.assertEqual(result["headers"], {
-            "User-Agent": "MusicBot/1.0\r\nAccept: */*\r\nReferer: https://soundcloud.com/\r\n"
-        })
+        self.assertEqual(result["headers"], headers)
+
+
+class _FakeResponse:
+    def __init__(self, status=200, content_type="audio/mpeg", body=b"audio-bytes"):
+        self.status = status
+        self.headers = {"Content-Type": content_type}
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self, size=-1):
+        return self.body[:size]
+
+
+class PlayableTests(unittest.TestCase):
+    @patch("sources._open", return_value=_FakeResponse())
+    def test_accepts_nonempty_audio_response(self, open_stream):
+        self.assertTrue(sources.playable("https://stream.example/audio"))
+        self.assertEqual(open_stream.call_args.args[1]["Range"], "bytes=0-4095")
+
+    @patch("sources._open", return_value=_FakeResponse(content_type="text/html",
+                                                        body=b"<html>blocked</html>"))
+    def test_rejects_html_error_page(self, _open_stream):
+        self.assertFalse(sources.playable("https://stream.example/audio"))
+
+    @patch("sources._open", return_value=_FakeResponse(content_type="application/json",
+                                                        body=b'{"error":"denied"}'))
+    def test_rejects_json_error_response(self, _open_stream):
+        self.assertFalse(sources.playable("https://stream.example/audio"))
+
+    @patch("sources._open", side_effect=__import__("urllib.error").error.HTTPError(
+        "https://stream.example/audio", 416, "Range Not Satisfiable", {}, None))
+    def test_rejects_range_not_satisfiable(self, _open_stream):
+        self.assertFalse(sources.playable("https://stream.example/audio"))
 
 
 if __name__ == "__main__":
