@@ -13,7 +13,8 @@ API_ID=...
 API_HASH=...
 BOT_TOKEN=...
 SESSION_STRING=...
-COOKIES_BASE64=...
+SAAVN_API=https://your-jiosaavn-api.example.com/api
+COOKIES_BASE64=... (optional; YouTube is disabled by default)
 ```
 3. Railway redeploys. Open **Deployments → View logs**; you should see `starting bot.py`.
 
@@ -36,8 +37,18 @@ SoundCloud → Audius → optional Saavn/Jamendo → YouTube (last resort).
 Audius tries multiple discovery hosts and matching streamable results before giving up. Piped was
 removed because its instances are unreliable. Change the order with `SOURCE_ORDER`.
 
-Use `/testaudio` in a group with an active voice chat (stop current playback first) to play a short
-built-in tone and isolate Telegram voice output from external music sources.
+## Commands (Musicxdy-only names)
+
+All group commands use the `/mx` prefix so they are less likely to collide with commands from other bots:
+
+- `/mxstartplay <song or link>` — start playback (or add to queue)
+- `/mxplay <song or link>` — alias for start/play
+- `/mxstopplay` — stop playback and clear the queue
+- `/mxpause`, `/mxresume`, `/mxskip`, `/mxprevious`
+- `/mxqueue`, `/mxshuffle`, `/mxloop`
+- `/mxtestaudio` — test Telegram voice-chat audio
+
+The old generic commands (`/play`, `/stop`, etc.) are no longer registered. Inline player buttons continue to work.
 
 The bot can only play streams a provider makes publicly available to it. It cannot guarantee every
 song or subscriber/premium quality, and it does not bypass login, DRM, or provider bot restrictions.
