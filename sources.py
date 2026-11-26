@@ -85,10 +85,19 @@ def _finish(info: dict) -> dict:
     headers = info.get("headers") or {}
     if not playable(info["url"], headers):
         raise RuntimeError(f"{info.get('source')}: stream not reachable")
-    # Keep yt-dlp's HTTP headers as separate entries. PyTgCalls passes each
-    # entry to FFmpeg as its own -headers argument; folding several headers
-    # into one value creates malformed request headers and can yield silence.
-    info["headers"] = dict(headers)
+    # FFmpeg's -headers option takes one CRLF-delimited header block.
+    # PyTgCalls emits one -headers argument per dict entry, so combine all
+    # request headers into a single value before handing them to MediaStream.
+    if len(headers) > 1:
+        items = list(headers.items())
+        first_name, first_value = items[0]
+        info["headers"] = {
+            first_name: first_value + "".join(
+                f"\\r\\n{name}: {value}" for name, value in items[1:]
+            ) + "\\r\\n"
+        }
+    else:
+        info["headers"] = dict(headers)
     return info
 
 
