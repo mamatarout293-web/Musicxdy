@@ -634,10 +634,13 @@ async def on_bot_group_membership(_, update):
         if not user or user.id != me.id:
             return
         status = getattr(member, "status", "")
-        if status not in ("member", "administrator"):
+        status = getattr(status, "value", status)
+        if str(status).lower() not in ("member", "administrator"):
             return
         chat = update.chat
-        if getattr(chat, "type", None) not in ("group", "supergroup"):
+        chat_type = getattr(chat, "type", "")
+        chat_type = getattr(chat_type, "value", chat_type)
+        if str(chat_type).lower() not in ("group", "supergroup"):
             return
         if not await ensure_assistant_in_group(chat.id):
             print(
