@@ -1,0 +1,464 @@
+"""Multi-source song resolver.
+
+resolve(query) walks a list of sources (YouTube -> SoundCloud -> Piped -> Audius -> ...) and returns the
+first one that gives a stream URL that REALLY answers. A source that keeps failing is put on a short
+cooldown so it can't slow down every request, but it is still tried last - the bot never gives up while
+anything might still work.
+
+Env options (all optional):
+  SOURCE_ORDER      e.g. "youtube,soundcloud,piped,audius"   (order / subset of sources)
+  SAAVN_API         base URL of a JioSaavn-compatible API (enables the "saavn" source)
+  JAMENDO_CLIENT_ID free Jamendo key (enables the "jamendo" source)
+  PIPED_APIS        comma separated Piped API URLs (default: auto-discovered)
+  COOKIES_TXT / COOKIES_BASE64   YouTube cookies (default: cookies.txt next to this file)
+  RESOLVE_TIMEOUT   max seconds spent on one search (default 55)
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import random
+import re
+import shutil
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from yt_dlp import YoutubeDL
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/124.0 Safari/537.36")
+HTTP_TIMEOUT = 8
+DEADLINE = int(os.environ.get("RESOLVE_TIMEOUT", "55"))
+URL_RE = re.compile(r"^https?://", re.I)
+
+
+class NotFound(Exception):
+    """Source works, but has no (relevant) result. Does not penalise the source."""
+
+
+class Unavailable(Exception):
+    """No source could provide a playable stream."""
+
+    def __init__(self, errors: list[str]):
+        super().__init__("; ".join(errors) or "no source available")
+        self.errors = errors
+
+
+def log(*a):
+    print("[sources]", *a, flush=True)
+
+
+# ───────────────────────── helpers ─────────────────────────
+def _open(url: str, headers: dict | None = None, timeout: float = HTTP_TIMEOUT):
+    h = {"User-Agent": UA, "Accept": "*/*"}
+    h.update(headers or {})
+    return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
+
+
+def get_json(url: str, timeout: float = HTTP_TIMEOUT):
+    with _open(url, {"Accept": "application/json"}, timeout) as r:
+        return json.loads(r.read(3_000_000).decode("utf-8", "replace"))
+
+
+def playable(url: str, headers: dict | None = None) -> bool:
+    """Does this stream URL actually answer? (a dead/expired/blocked URL would give silent audio)"""
+    h = dict(headers or {})
+    h.pop("Accept-Encoding", None)
+    h["Range"] = "bytes=0-2047"
+    try:
+        with _open(url, h) as r:
+            r.read(1)
+            return 200 <= r.status < 400
+    except urllib.error.HTTPError as e:
+        return e.code == 416
+    except Exception:
+        return False
+
+
+def _finish(info: dict) -> dict:
+    if not info.get("url"):
+        raise RuntimeError("no stream url")
+    if not playable(info["url"], info.get("headers")):
+        raise RuntimeError(f"{info.get('source')}: stream not reachable")
+    return info
+
+
+_STOP = {"official", "video", "audio", "lyrics", "lyric", "song", "full", "new", "hd", "the", "a", "of", "ft", "feat", "and"}
+
+
+def _tokens(s: str) -> set[str]:
+    return {t for t in re.findall(r"\w+", (s or "").lower()) if t not in _STOP}
+
+
+def _relevant(query: str, title: str, artist: str = "") -> bool:
+    """Cheap guard so a fallback source doesn't play a totally different song."""
+    q = _tokens(query)
+    if not q:
+        return True
+    have = _tokens(f"{title} {artist}")
+    return len(q & have) / len(q) >= 0.5
+
+
+def _prepare_cookies() -> str | None:
+    """yt-dlp rewrites its cookie file, so work on a writable copy."""
+    dst = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+    try:
+        b64 = os.environ.get("COOKIES_BASE64", "").strip()
+        txt = os.environ.get("COOKIES_TXT", "")
+        if b64:
+            data = base64.b64decode(b64).decode("utf-8", "replace")
+        elif txt.strip():
+            data = txt.replace("\\n", "\n")
+        else:
+            src = os.path.join(ROOT, "cookies.txt")
+            if not os.path.exists(src):
+                return None
+            shutil.copyfile(src, dst)
+            return dst
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write(data)
+        return dst
+    except Exception as e:
+        log("cookies not loaded:", e)
+        return None
+
+
+COOKIES = _prepare_cookies()
+
+
+def _ydl_opts(cookies: bool = True, clients: list[str] | None = None) -> dict:
+    o = {
+        "format": "bestaudio/best",
+        "js_runtimes": {"deno": {}, "node": {}},
+        "remote_components": ["ejs:github"],
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": 10,
+        "retries": 1,
+        "extractor_retries": 1,
+    }
+    if cookies and COOKIES:
+        o["cookiefile"] = COOKIES
+    if clients:
+        o["extractor_args"] = {"youtube": {"player_client": clients}}
+    return o
+
+
+def _ydl_entries(opts: dict, target: str) -> list[dict]:
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(target, download=False)
+    if not info:
+        raise NotFound("no results")
+    entries = [e for e in (info.get("entries") or [info]) if e]
+    if not entries:
+        raise NotFound("no results")
+    return entries
+
+
+def _norm(info: dict, source: str) -> dict:
+    return {
+        "title": info.get("title") or "Unknown",
+        "url": info.get("url"),
+        "page": info.get("webpage_url") or info.get("original_url") or "",
+        "duration": int(info.get("duration") or 0),
+        "artist": info.get("artist") or info.get("uploader") or info.get("channel") or "",
+        "headers": info.get("http_headers") or {},
+        "source": source,
+    }
+
+
+# ───────────────────────── sources ─────────────────────────
+# Tried in order until YouTube returns a playable audio format
+YT_ATTEMPTS = [
+    {},                                                 # default clients + cookies
+    {"clients": ["tv", "web_safari"]},                  # with cookies
+    {"clients": ["android_vr"], "cookies": False},      # no cookies, no JS needed
+    {"clients": ["mweb"], "cookies": False},
+]
+
+
+def _youtube(target: str) -> dict:
+    last: Exception | None = None
+    for a in YT_ATTEMPTS:
+        try:
+            entries = _ydl_entries(_ydl_opts(a.get("cookies", True), a.get("clients")), target)
+            info = _norm(entries[0], "youtube")
+            return _finish(info)  # unreachable URL -> try the next YouTube client
+        except NotFound:
+            raise
+        except Exception as e:
+            last = e
+            log("youtube attempt failed:", str(e)[:160])
+    raise last or RuntimeError("youtube failed")
+
+
+def _soundcloud(q: str) -> dict:
+    last: Exception | None = None
+    for e in _ydl_entries(_ydl_opts(cookies=False), f"scsearch3:{q}"):
+        if "preview" in f"{e.get('format_note', '')} {e.get('format_id', '')}".lower():
+            continue  # 30-second Go+ preview, not the song
+        info = _norm(e, "soundcloud")
+        if not _relevant(q, info["title"], info["artist"]):
+            continue
+        try:
+            return _finish(info)
+        except Exception as ex:
+            last = ex
+    if last:
+        raise last
+    raise NotFound("soundcloud: no relevant result")
+
+
+_piped_cache = {"apis": [], "t": 0.0}
+PIPED_DEFAULT = ["https://pipedapi.kavin.rocks", "https://pipedapi.adminforge.de", "https://api.piped.private.coffee"]
+
+
+def _piped_apis() -> list[str]:
+    env = os.environ.get("PIPED_APIS", "")
+    if env.strip():
+        return [x.strip().rstrip("/") for x in env.split(",") if x.strip()]
+    if _piped_cache["apis"] and time.time() - _piped_cache["t"] < 3600:
+        return _piped_cache["apis"]
+    apis: list[str] = []
+    try:
+        data = get_json("https://piped-instances.kavin.rocks/")
+        data.sort(key=lambda d: d.get("uptime_24h") or 0, reverse=True)
+        apis = [d["api_url"].rstrip("/") for d in data if d.get("api_url")][:6]
+    except Exception as e:
+        log("piped instance list unavailable:", str(e)[:100])
+    apis = apis or PIPED_DEFAULT
+    _piped_cache.update(apis=apis, t=time.time())
+    return apis
+
+
+def _piped(q: str) -> dict:
+    last: Exception | None = None
+    for api in _piped_apis()[:3]:
+        try:
+            items = []
+            for flt in ("music_songs", "videos"):
+                d = get_json(f"{api}/search?q={urllib.parse.quote(q)}&filter={flt}")
+                items = [i for i in d.get("items", []) if str(i.get("url", "")).startswith("/watch")]
+                if items:
+                    break
+            if not items:
+                raise NotFound("piped: no results")
+            it = items[0]
+            vid = urllib.parse.parse_qs(urllib.parse.urlparse(it["url"]).query)["v"][0]
+            s = get_json(f"{api}/streams/{vid}")
+            audio = [a for a in s.get("audioStreams", []) if a.get("url") and not a.get("videoOnly")]
+            audio.sort(key=lambda a: a.get("bitrate") or 0, reverse=True)
+            for a in audio[:2]:
+                info = {
+                    "title": s.get("title") or it.get("title") or "Unknown",
+                    "url": a["url"],
+                    "page": f"https://www.youtube.com/watch?v={vid}",
+                    "duration": int(s.get("duration") or it.get("duration") or 0),
+                    "artist": s.get("uploader") or it.get("uploaderName") or "",
+                    "headers": {},
+                    "source": "piped",
+                }
+                try:
+                    return _finish(info)
+                except Exception as ex:
+                    last = ex
+            last = last or RuntimeError("piped: no audio stream")
+        except NotFound:
+            raise
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("piped: no instance")
+
+
+_audius_cache = {"hosts": [], "t": 0.0}
+
+
+def _audius_hosts() -> list[str]:
+    if _audius_cache["hosts"] and time.time() - _audius_cache["t"] < 3600:
+        return list(_audius_cache["hosts"])
+    hosts: list[str] = []
+    try:
+        hosts = [h.rstrip("/") for h in get_json("https://api.audius.co").get("data", [])]
+        random.shuffle(hosts)
+    except Exception as e:
+        log("audius host list unavailable:", str(e)[:100])
+    hosts = hosts or ["https://discoveryprovider.audius.co"]
+    _audius_cache.update(hosts=hosts, t=time.time())
+    return list(hosts)
+
+
+def _audius(q: str) -> dict:
+    last: Exception | None = None
+    for host in _audius_hosts()[:3]:
+        try:
+            d = get_json(f"{host}/v1/tracks/search?query={urllib.parse.quote(q)}&limit=5&app_name=musicbot")
+            for t in d.get("data", []):
+                artist = (t.get("user") or {}).get("name", "")
+                if t.get("is_streamable") is False or not _relevant(q, t.get("title", ""), artist):
+                    continue
+                return _finish({
+                    "title": t.get("title") or "Unknown",
+                    "url": f"{host}/v1/tracks/{t['id']}/stream?app_name=musicbot",
+                    "page": "https://audius.co" + (t.get("permalink") or ""),
+                    "duration": int(t.get("duration") or 0),
+                    "artist": artist,
+                    "headers": {},
+                    "source": "audius",
+                })
+            raise NotFound("audius: no relevant result")
+        except NotFound:
+            raise
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("audius: no host")
+
+
+def _jamendo(q: str) -> dict:
+    cid = os.environ["JAMENDO_CLIENT_ID"]
+    d = get_json("https://api.jamendo.com/v3.0/tracks/?client_id=%s&format=json&limit=5&audioformat=mp32&search=%s"
+                 % (cid, urllib.parse.quote(q)))
+    for t in d.get("results", []):
+        if t.get("audio") and _relevant(q, t.get("name", ""), t.get("artist_name", "")):
+            return _finish({"title": t.get("name") or "Unknown", "url": t["audio"], "page": t.get("shareurl", ""),
+                            "duration": int(t.get("duration") or 0), "artist": t.get("artist_name", ""),
+                            "headers": {}, "source": "jamendo"})
+    raise NotFound("jamendo: no relevant result")
+
+
+def _saavn(q: str) -> dict:
+    base = os.environ["SAAVN_API"].rstrip("/")
+    d = get_json(f"{base}/search/songs?query={urllib.parse.quote(q)}&limit=5")
+    for r in (d.get("data") or {}).get("results") or []:
+        dl = [x for x in (r.get("downloadUrl") or []) if x.get("url")]
+        names = ", ".join(a.get("name", "") for a in ((r.get("artists") or {}).get("primary") or []))
+        if dl and _relevant(q, r.get("name", ""), names):
+            return _finish({"title": r.get("name") or "Unknown", "url": dl[-1]["url"], "page": r.get("url", ""),
+                            "duration": int(r.get("duration") or 0), "artist": names, "headers": {}, "source": "saavn"})
+    raise NotFound("saavn: no relevant result")
+
+
+# ───────────────────────── registry ─────────────────────────
+class Source:
+    def __init__(self, name, fn):
+        self.name, self.fn = name, fn
+        self.fails = 0
+        self.dead_until = 0.0
+
+    @property
+    def alive(self) -> bool:
+        return time.time() >= self.dead_until
+
+    def good(self):
+        self.fails, self.dead_until = 0, 0.0
+
+    def bad(self):
+        self.fails += 1
+        self.dead_until = time.time() + min(30 * 2 ** (self.fails - 1), 600)  # 30s, 60s, ... max 10 min
+
+
+def _build() -> list[Source]:
+    s = [Source("youtube", lambda q: _youtube(f"ytsearch1:{q}"))]
+    if os.environ.get("SAAVN_API"):
+        s.append(Source("saavn", _saavn))
+    s += [Source("soundcloud", _soundcloud), Source("piped", _piped), Source("audius", _audius)]
+    if os.environ.get("JAMENDO_CLIENT_ID"):
+        s.append(Source("jamendo", _jamendo))
+    order = [x.strip() for x in os.environ.get("SOURCE_ORDER", "").split(",") if x.strip()]
+    if order:
+        by = {x.name: x for x in s}
+        s = [by[n] for n in order if n in by] or s
+    return s
+
+
+SOURCES = _build()
+
+
+# ───────────────────────── URLs ─────────────────────────
+def _url_kind(url: str) -> str:
+    host = urllib.parse.urlparse(url).netloc.lower()
+    if "youtube.com" in host or "youtu.be" in host:
+        return "youtube"
+    if "soundcloud.com" in host:
+        return "soundcloud"
+    if "spotify.com" in host:
+        return "spotify"
+    return "direct"
+
+
+def _title_hint(url: str) -> str | None:
+    """Name of the song behind a link, so another source can search for it."""
+    try:
+        kind = _url_kind(url)
+        if kind == "youtube":
+            m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/)([\w-]{11})", url)
+            if m:
+                d = get_json("https://www.youtube.com/oembed?format=json&url="
+                             + urllib.parse.quote(f"https://www.youtube.com/watch?v={m.group(1)}", safe=""))
+                return d.get("title")
+        elif kind == "spotify":
+            with _open(url) as r:
+                page = r.read(400_000).decode("utf-8", "replace")
+            m = re.search(r"<title>(.*?)</title>", page, re.S)
+            if m:
+                t = re.sub(r"\s*\|\s*Spotify.*$", "", m.group(1).strip())
+                t = re.sub(r"\s*-\s*(song|single|album)?\s*(and lyrics)?\s*by\s*", " ", t, flags=re.I)
+                return t.strip() or None
+    except Exception as e:
+        log("title lookup failed:", str(e)[:100])
+    return None
+
+
+def _direct(url: str, kind: str) -> dict:
+    if kind == "youtube":
+        return _youtube(url)
+    entries = _ydl_entries(_ydl_opts(cookies=False), url)
+    return _finish(_norm(entries[0], kind))
+
+
+# ───────────────────────── main entry ─────────────────────────
+def resolve(query: str, skip=()) -> dict:
+    """Returns {title,url,page,duration,artist,headers,source}. `skip` = source names to avoid."""
+    skip = set(skip)
+    query = query.strip()
+    t0 = time.time()
+    errors: list[str] = []
+
+    if URL_RE.match(query):
+        kind = _url_kind(query)
+        if kind not in skip and kind != "spotify":
+            try:
+                return _direct(query, kind)
+            except Exception as e:
+                errors.append(f"{kind}: {str(e)[:100]}")
+                log("direct link failed:", str(e)[:160])
+        hint = _title_hint(query)
+        if not hint:
+            raise Unavailable(errors or ["could not read that link"])
+        log("link failed/unsupported, searching other sources for:", hint)
+        query = hint
+
+    ordered = [s for s in SOURCES if s.name not in skip]
+    ordered.sort(key=lambda s: not s.alive)  # healthy sources first, cooling-down ones as last resort
+    for s in ordered:
+        if time.time() - t0 > DEADLINE:
+            errors.append("timeout")
+            break
+        try:
+            info = s.fn(query)
+            s.good()
+            log(f"'{query[:50]}' -> {s.name}")
+            return info
+        except NotFound as e:
+            errors.append(str(e))
+        except Exception as e:
+            s.bad()
+            errors.append(f"{s.name}: {str(e)[:100]}")
+            log(f"{s.name} failed (cooldown {int(s.dead_until - time.time())}s):", str(e)[:160])
+    raise Unavailable(errors)

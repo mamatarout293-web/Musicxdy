@@ -1,0 +1,5 @@
+kurigram==2.2.27
+py-tgcalls==3.0.1
+ntgcalls==3.0.7
+tgcrypto==1.2.5
+yt-dlp[default]

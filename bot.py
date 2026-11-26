@@ -1,0 +1,532 @@
+"""Clean voice-chat music bot. Best-quality audio, plain text, no thumbnails, no effects."""
+import asyncio
+
+# One event loop for everything: pyrogram binds to the loop that exists when it is created.
+LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(LOOP)
+
+import html
+import json
+import os
+import random
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+
+import config
+
+config.load_env()
+_missing = config.missing()
+if _missing:
+    print("MISSING SETTINGS: " + ", ".join(_missing) +
+          "  -> add them in Railway > Variables (or in the .env file).", flush=True)
+    sys.exit(2)
+
+from pyrogram import Client, filters, idle
+from pyrogram.raw import functions
+from pyrogram.raw.types import InputStickerSetShortName
+from pyrogram.types import CallbackQuery, Message
+from pytgcalls import PyTgCalls, filters as call_filters
+from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
+
+import sources
+
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+SESSION = os.environ["SESSION_STRING"]  # assistant account that joins the voice chat
+
+# in_memory: nothing is written to disk, so restarts/redeploys on Railway never hit a stale session file
+bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, sleep_threshold=60)
+assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH, session_string=SESSION,
+                   in_memory=True, sleep_threshold=60)
+calls = PyTgCalls(assistant)
+
+
+@dataclass
+class Track:
+    title: str
+    url: str       # direct audio stream
+    page: str      # youtube link
+    duration: int
+    by: str
+    artist: str = ""
+    headers: dict = field(default_factory=dict)
+    started: float = 0.0
+    paused_at: float = 0.0
+    msg: int = 0
+    chat_id: int = 0
+    task: object = None
+    source: str = ""        # which source produced the stream (youtube, soundcloud, ...)
+    query: str = ""         # what the user asked for, used to find the song again elsewhere
+    resolved_at: float = 0.0
+    retries: int = 0
+    bad: set = field(default_factory=set)  # sources that already failed for this track
+
+
+queues: dict[int, list[Track]] = {}
+history: dict[int, list[Track]] = {}
+loop: dict[int, bool] = {}
+
+
+def fmt(sec: int) -> str:
+    m, s = divmod(int(sec or 0), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+STREAM_MAX_AGE = 3000  # seconds; YouTube stream links expire after a few hours
+
+
+async def reresolve(t: Track):
+    """Find the song again (skipping sources that already failed for it) and update the track."""
+    info = await asyncio.to_thread(sources.resolve, t.query or t.title, t.bad)
+    t.url, t.headers, t.source = info["url"], info.get("headers") or {}, info["source"]
+    t.page = info.get("page") or t.page
+    t.duration = info.get("duration") or t.duration
+    t.resolved_at = time.time()
+
+
+async def ensure_fresh(t: Track):
+    if t.resolved_at and time.time() - t.resolved_at > STREAM_MAX_AGE:
+        print("stream link is old, refreshing:", t.title, flush=True)
+        await reresolve(t)
+
+
+# ── premium emojis (resolved from the packs below; falls back to normal emoji) ──
+PACKS = [p.strip() for p in os.environ.get(
+    "EMOJI_PACKS", "sexypiyush69_79e604_by_SexyPiyush_BOT,NewsEmoji,RestrictedEmoji").split(",") if p.strip()]
+
+# role -> (default emoji, alternatives to look for in the packs)
+ROLES = {
+    "now": ("🎧", ["🎧", "🎵", "🎶"]),
+    "pause": ("⏸", ["⏸", "⏯"]),
+    "play": ("▶️", ["▶️", "▶", "🎶"]),
+    "user": ("👤", ["👤", "🙋", "👑"]),
+    "prev": ("⏮", ["⏮", "◀️", "⬅️"]),
+    "skip": ("⏭", ["⏭", "⏩", "➡️"]),
+    "shuffle": ("🔀", ["🔀", "🔄"]),
+    "loop": ("🔁", ["🔁", "🔂", "♻️"]),
+    "stop": ("⏹", ["⏹", "🛑", "❌"]),
+    "queue": ("📥", ["📥", "📋", "📝"]),
+}
+EMO: dict[str, tuple[str, str]] = {}  # role -> (char, custom_emoji_id or "")
+
+
+async def load_emojis():
+    found: dict[str, str] = {}
+    for name in PACKS:
+        for client in (bot, assistant):
+            try:
+                res = await client.invoke(functions.messages.GetStickerSet(
+                    stickerset=InputStickerSetShortName(short_name=name), hash=0))
+            except Exception:
+                continue
+            docs = {d.id for d in res.documents}
+            for p in res.packs:
+                ch = (p.emoticon or "")
+                for d in p.documents:
+                    if d in docs:
+                        found.setdefault(ch, str(d))
+                        found.setdefault(ch.replace("\ufe0f", ""), str(d))
+                        break
+            break
+    for role, (default, alts) in ROLES.items():
+        for ch in alts:
+            cid = found.get(ch) or found.get(ch.replace("\ufe0f", ""))
+            if cid:
+                EMO[role] = (ch, cid)
+                break
+        else:
+            EMO[role] = (default, "")
+    print("Premium emojis:", {r: bool(v[1]) for r, v in EMO.items()})
+
+
+def pe(role: str) -> str:
+    ch, cid = EMO.get(role, (ROLES[role][0], ""))
+    return f'<tg-emoji emoji-id="{cid}">{ch}</tg-emoji>' if cid else ch
+
+
+LINE = "━━━━━━━━━━━━━━━━━━"
+
+
+def elapsed(t: Track) -> int:
+    now = t.paused_at or time.time()
+    return max(0, min(int(now - t.started), t.duration or 10**9))
+
+
+def card(t: Track) -> str:
+    e, d = elapsed(t), t.duration
+    filled = round(12 * e / d) if d else 0
+    bar = "▰" * filled + "▱" * (12 - filled)
+    icon = pe("pause") if t.paused_at else pe("play")
+    head = f"{pe('pause')} <b>PAUSED</b>" if t.paused_at else f"{pe('now')} <b>NOW PLAYING</b>"
+    artist = f"\n{html.escape(t.artist)}" if t.artist else ""
+    return (
+        f"{head}\n\n<b>{html.escape(t.title.upper())}</b>{artist}\n\n{LINE}\n"
+        f"{icon}  {bar}  <code>{fmt(e)} / {fmt(d)}</code>\n\n"
+        f"{pe('user')} Requested by: {html.escape(t.by)}\n{LINE}"
+    )
+
+
+def _call(method: str, payload: dict) -> dict:
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        return json.load(e)
+
+
+async def api(method: str, payload: dict, fallback_markup: dict | None = None) -> dict:
+    """Bot API call; if colours/premium icons are rejected, retries with plain buttons."""
+    res = await asyncio.to_thread(_call, method, payload)
+    if not res.get("ok") and fallback_markup is not None \
+            and "not modified" not in str(res.get("description", "")):
+        res = await asyncio.to_thread(_call, method, {**payload, "reply_markup": fallback_markup})
+    return res
+
+
+def kb(chat_id: int, t: Track, plain: bool = False) -> dict:
+    """Unified colours: green = play/pause, blue = navigation, red = stop.
+    Premium emoji icons are used when available; plain=True is the safe fallback."""
+    def B(role, label, data, style):
+        ch, cid = EMO.get(role, (ROLES[role][0], ""))
+        if plain or not cid:
+            return {"text": f"{ch} {label}" if plain or not cid else label,
+                    "callback_data": f"ctl:{data}", **({} if plain else {"style": style})}
+        return {"text": label, "callback_data": f"ctl:{data}", "style": style, "icon_custom_emoji_id": cid}
+
+    pause = B("play", "Resume", "resume", "success") if t.paused_at else B("pause", "Pause", "pause", "success")
+    on = loop.get(chat_id)
+    return {"inline_keyboard": [
+        [B("prev", "Previous", "prev", "primary"), pause, B("skip", "Skip", "skip", "primary")],
+        [B("shuffle", "Shuffle", "shuffle", "primary"),
+         B("loop", "Loop ✓" if on else "Loop", "loop", "success" if on else "primary"),
+         B("stop", "Stop", "stop", "danger")],
+    ]}
+
+
+async def refresh(chat_id: int, t: Track):
+    await api("editMessageText", {
+        "chat_id": chat_id, "message_id": t.msg, "text": card(t), "parse_mode": "HTML",
+        "reply_markup": kb(chat_id, t), "link_preview_options": {"is_disabled": True},
+    }, kb(chat_id, t, plain=True))
+
+
+async def updater(t: Track):
+    last = ""
+    try:
+        while True:
+            await asyncio.sleep(10)
+            try:
+                txt = card(t)
+                if txt != last:
+                    await refresh(t.chat_id, t)
+                    last = txt
+            except Exception as e:  # a network hiccup must not kill the progress bar
+                print("card update failed:", repr(e)[:120], flush=True)
+    except asyncio.CancelledError:
+        pass
+
+
+async def start_stream(chat_id: int, t: Track):
+    kw = dict(
+        audio_parameters=AudioQuality.STUDIO,  # 48 kHz stereo, top quality
+        video_flags=MediaStream.Flags.IGNORE,
+    )
+    try:
+        stream = MediaStream(t.url, headers=t.headers, **kw)  # YouTube links need their request headers
+    except TypeError:
+        stream = MediaStream(t.url, **kw)
+    try:
+        await calls.play(chat_id, stream)
+    except Exception as e:
+        print("calls.play failed:", repr(e), flush=True)
+        raise
+    t.started = time.time()
+    t.paused_at = 0.0
+
+
+async def announce(chat_id: int, t: Track):
+    res = await api("sendMessage", {
+        "chat_id": chat_id, "text": card(t), "parse_mode": "HTML",
+        "reply_markup": kb(chat_id, t), "link_preview_options": {"is_disabled": True},
+    }, kb(chat_id, t, plain=True))
+    t.chat_id = chat_id
+    t.msg = res.get("result", {}).get("message_id", 0)
+    t.task = asyncio.create_task(updater(t))
+
+
+def finish(t: Track):
+    if t.task:
+        t.task.cancel()
+
+
+async def notify(chat_id: int, text: str):
+    try:
+        await api("sendMessage", {"chat_id": chat_id, "text": text})
+    except Exception:
+        pass
+
+
+async def leave(chat_id: int):
+    queues.pop(chat_id, None)
+    try:
+        await calls.leave_call(chat_id)
+    except Exception:
+        pass
+
+
+async def play_next(chat_id: int, force: bool = False):
+    """Advance the queue. A track that can't be played is skipped - the queue never gets stuck."""
+    q = queues.get(chat_id, [])
+    if q and loop.get(chat_id) and not force:
+        try:
+            await ensure_fresh(q[0])
+            await start_stream(chat_id, q[0])  # replay same track, same card
+            return
+        except Exception as e:
+            print("loop replay failed:", repr(e)[:200], flush=True)
+    while True:
+        if q:
+            done = q.pop(0)
+            finish(done)
+            if done.started:
+                history.setdefault(chat_id, []).append(done)
+                del history[chat_id][:-20]
+        if not q:
+            await leave(chat_id)
+            return
+        try:
+            await ensure_fresh(q[0])
+            await start_stream(chat_id, q[0])
+            await announce(chat_id, q[0])
+            return
+        except Exception as e:
+            print("could not play, skipping:", q[0].title, repr(e)[:200], flush=True)
+            await notify(chat_id, f"Couldn't play \"{q[0].title}\", skipping it.")
+
+
+async def handle_end(chat_id: int):
+    q = queues.get(chat_id)
+    if not q:
+        return
+    t = q[0]
+    # Stream "ended" almost instantly although the song is long = the link was dead. Try another source.
+    quick = bool(t.started) and not t.paused_at and (time.time() - t.started) < 4 and t.duration > 20
+    if quick and t.retries < 3:
+        t.retries += 1
+        t.bad.add(t.source)
+        print(f"stream died right away ({t.source}), trying another source (try {t.retries})", flush=True)
+        try:
+            await reresolve(t)
+            await start_stream(chat_id, t)
+            return
+        except Exception as e:
+            print("no other source worked:", repr(e)[:200], flush=True)
+    await play_next(chat_id, force=quick)
+
+
+async def act(chat_id: int, action: str) -> str:
+    q = queues.get(chat_id)
+    if not q:
+        return "Nothing is playing."
+    cur = q[0]
+    if action == "pause":
+        if cur.paused_at:
+            return "Already paused."
+        await calls.pause(chat_id)
+        cur.paused_at = time.time()
+        await refresh(chat_id, cur)
+        return "⏸ Paused"
+    if action == "resume":
+        if not cur.paused_at:
+            return "Already playing."
+        await calls.resume(chat_id)
+        cur.started += time.time() - cur.paused_at
+        cur.paused_at = 0.0
+        await refresh(chat_id, cur)
+        return "▶️ Resumed"
+    if action == "skip":
+        await play_next(chat_id, force=True)
+        return "⏭ Skipped"
+    if action == "prev":
+        h = history.get(chat_id)
+        if not h:
+            return "No previous song."
+        finish(cur)
+        q.insert(0, h.pop())
+        await start_stream(chat_id, q[0])
+        await announce(chat_id, q[0])
+        return "⏮ Previous"
+    if action == "shuffle":
+        if len(q) < 3:
+            return "Not enough songs in the queue."
+        rest = q[1:]
+        random.shuffle(rest)
+        q[1:] = rest
+        return "🔀 Queue shuffled"
+    if action == "loop":
+        loop[chat_id] = not loop.get(chat_id)
+        await refresh(chat_id, cur)
+        return "🔁 Loop on" if loop[chat_id] else "🔁 Loop off"
+    if action == "stop":
+        for x in queues.pop(chat_id, []):
+            finish(x)
+        loop.pop(chat_id, None)
+        try:
+            await calls.leave_call(chat_id)
+        except Exception:
+            pass
+        await api("editMessageText", {"chat_id": chat_id, "message_id": cur.msg,
+                                      "text": f"{pe('stop')} <b>STOPPED</b>", "parse_mode": "HTML",
+                                      "reply_markup": {"inline_keyboard": []}})
+        return "⏹ Stopped"
+    return ""
+
+
+@calls.on_update(call_filters.stream_end)
+async def on_end(_, update: StreamEnded):
+    try:
+        await handle_end(update.chat_id)
+    except Exception as e:
+        print("on_end failed:", repr(e)[:200], flush=True)
+
+
+@bot.on_message(filters.command("play") & filters.group)
+async def play(_, m: Message):
+    query = " ".join(m.command[1:]).strip()
+    if not query and m.reply_to_message:
+        query = (m.reply_to_message.text or "").strip()
+    if not query:
+        return await m.reply_text("Usage: /play song name or link")
+
+    status = await m.reply_text("Searching…")
+    try:
+        info = await asyncio.to_thread(sources.resolve, query)
+    except Exception as e:
+        print("search failed:", repr(e)[:400], flush=True)
+        return await status.edit_text("Couldn't find a playable version of that song on any source. "
+                                      "Try another name, or try again in a minute.")
+
+    t = Track(
+        title=info.get("title", "Unknown"),
+        url=info["url"],
+        page=info.get("page", ""),
+        duration=info.get("duration") or 0,
+        by=m.from_user.first_name if m.from_user else "Unknown",
+        artist=info.get("artist") or "",
+        headers=info.get("headers") or {},
+        source=info.get("source", ""),
+        query=query,
+        resolved_at=time.time(),
+    )
+    q = queues.setdefault(m.chat.id, [])
+    q.append(t)
+
+    if len(q) == 1:
+        try:
+            try:
+                await start_stream(m.chat.id, t)
+            except Exception as e:
+                call_problem = any(w in str(e).lower() + type(e).__name__.lower()
+                                   for w in ("group", "call", "voice", "peer", "participant", "admin", "forbidden"))
+                if call_problem:
+                    raise
+                print("start failed, trying another source:", repr(e)[:200], flush=True)
+                t.bad.add(t.source)
+                await reresolve(t)
+                await start_stream(m.chat.id, t)
+        except Exception as e:
+            q.clear()
+            return await status.edit_text(f"Couldn't start playback. Make sure a voice chat is open and the assistant is in the group.\n{e}")
+        await status.delete()
+        await announce(m.chat.id, t)
+    else:
+        await status.delete()
+        await api("sendMessage", {"chat_id": m.chat.id, "parse_mode": "HTML",
+                                  "text": f"{pe('queue')} <b>QUEUED #{len(q) - 1}</b>\n\n<b>{html.escape(t.title)}</b>\n{pe('user')} {html.escape(t.by)}"})
+
+
+def _cmd(name: str, action: str):
+    @bot.on_message(filters.command(name) & filters.group)
+    async def handler(_, m: Message):
+        try:
+            text = await act(m.chat.id, action)
+        except Exception as e:
+            print(f"/{name} failed:", repr(e)[:200], flush=True)
+            text = "Something went wrong."
+        await m.reply_text(text)
+
+
+for _n, _a in (("pause", "pause"), ("resume", "resume"), ("skip", "skip"),
+               ("stop", "stop"), ("prev", "prev"), ("shuffle", "shuffle"), ("loop", "loop")):
+    _cmd(_n, _a)
+
+
+@bot.on_callback_query(filters.regex(r"^ctl:"))
+async def buttons(_, cq: CallbackQuery):
+    try:
+        text = await act(cq.message.chat.id, cq.data.split(":", 1)[1])
+    except Exception:
+        text = "Something went wrong."
+    await cq.answer(text)
+
+
+@bot.on_message(filters.command("queue") & filters.group)
+async def show_queue(_, m: Message):
+    q = queues.get(m.chat.id)
+    if not q:
+        return await m.reply_text("Queue is empty.")
+    lines = [f"{pe('now')} <b>NOW PLAYING</b>\n{html.escape(q[0].title)} · {fmt(q[0].duration)}"]
+    if len(q) > 1:
+        lines.append(f"\n{pe('queue')} <b>UP NEXT</b>")
+        lines += [f"{i}. {html.escape(x.title)} · {fmt(x.duration)}" for i, x in enumerate(q[1:11], 1)]
+    await api("sendMessage", {"chat_id": m.chat.id, "parse_mode": "HTML", "text": "\n".join(lines)})
+
+
+async def watchdog():
+    """If Telegram stops answering for ~3 minutes, exit so the supervisor / Railway restarts everything."""
+    fails = 0
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await asyncio.wait_for(asyncio.gather(bot.get_me(), assistant.get_me()), 30)
+            fails = 0
+        except Exception as e:
+            fails += 1
+            print(f"watchdog: Telegram check failed ({fails}/3): {repr(e)[:120]}", flush=True)
+            if fails >= 3:
+                print("watchdog: restarting the bot", flush=True)
+                os._exit(1)
+
+
+async def main():
+    await bot.start()
+    await assistant.start()
+    await calls.start()
+    try:
+        await load_emojis()
+    except Exception as e:
+        print("emoji packs not loaded (plain emojis are used):", repr(e)[:120], flush=True)
+    asyncio.create_task(watchdog())
+    me = await bot.get_me()
+    print(f"Bot is running as @{me.username}", flush=True)
+    await idle()
+    print("Shutting down...", flush=True)
+    for c in (bot, assistant):
+        try:
+            await asyncio.wait_for(c.stop(), 5)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    LOOP.run_until_complete(main())
