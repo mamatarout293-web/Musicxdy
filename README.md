@@ -13,12 +13,13 @@ API_ID=...
 API_HASH=...
 BOT_TOKEN=...
 SESSION_STRING=...
-COOKIES_BASE64=...
+SAAVN_API=https://your-jiosaavn-api.example.com/api
+COOKIES_BASE64=... (optional; only if YouTube asks for login)
+COOKIES_FROM_BROWSER=auto (optional; imports an existing browser profile when available)
 ```
 3. Railway redeploys. Open **Deployments → View logs**; you should see `starting bot.py`.
 
-`COOKIES_BASE64` is optional (YouTube cookies). Create it from your cookies.txt with:
-`base64 -w0 cookies.txt` (Linux) or `base64 -i cookies.txt` (Mac).
+YouTube authentication is deployment-dependent. The resolver reads `COOKIES_BASE64`, `COOKIES_TXT`, or a local `cookies.txt`. It can also try importing cookies from an already logged-in browser profile (`COOKIES_FROM_BROWSER=auto`, or e.g. `chrome:Default`). This only imports an existing session; it cannot create a Google login or manufacture valid cookies. Railway containers normally have no logged-in browser profile, so provide a fresh Netscape-format cookie export through Railway Variables when YouTube requires sign-in. Never commit or share cookie contents.
 
 Variables set in Railway always win over a local `.env`.
 
@@ -32,14 +33,26 @@ Copy `.env.example` to `.env`, fill it in, then `python main.py`.
 - yt-dlp is updated on every start (YouTube changes often).
 
 ## Music sources
-SoundCloud, Audius, optional Saavn/Jamendo, and YouTube are searched concurrently; the first playable
-result starts playback. Providers on cooldown are only tried after healthy providers fail. Change the
-source set with `SOURCE_ORDER`; its order breaks ties between simultaneous results. Audius tries
-multiple discovery hosts and matching streamable results before giving up. Piped was removed because
-its instances are unreliable.
+YouTube is the primary resolver, with optional alternate providers. Configured healthy providers are
+searched concurrently; the first playable result starts playback. Providers on cooldown are only
+tried after healthy providers fail. `SOURCE_ORDER` selects providers and breaks ties between results.
+Spotify credentials can optionally improve canonical title/artist matching; Spotify does not provide
+audio streams.
 
-Use `/mxplayforce <song>` to replace the current track and clear the queue after the requested song is
-found.
+## Commands (Musicxdy-only names)
+
+All group commands use the `/mx` prefix so they are less likely to collide with commands from other bots:
+
+- `/mxstartplay <song or link>` — start playback (or add to queue)
+- `/mxplay <song or link>` — alias for start/play
+- `/mxstopplay` — stop playback and clear the queue
+- `/mxplayforce <song or link>` — replace the current track and clear the queue after finding the song
+- `/mxpause`, `/mxresume`, `/mxskip`, `/mxprevious`
+- `/mxseek <seconds|MM:SS|HH:MM:SS>` — seek in the current song
+- `/mxqueue`, `/mxshuffle`, `/mxloop`
+- `/mxtestaudio` — test Telegram voice-chat audio
+
+Commands are handled by the bot but aren't added to Telegram's command menu automatically; add them manually if you want them listed there. The old generic commands (`/play`, `/stop`, etc.) are not handled. Inline player buttons continue to work.
 
 The bot can only play streams a provider makes publicly available to it. It cannot guarantee every
 song or subscriber/premium quality, and it does not bypass login, DRM, or provider bot restrictions.

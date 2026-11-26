@@ -1,14 +1,16 @@
 """Multi-source song resolver.
 
-resolve(query) searches healthy sources concurrently and returns the first one that gives a stream URL
-that REALLY answers. A source that keeps failing is put on a short cooldown; it is only tried after
-healthy sources fail, so it can't slow down every request.
+YouTube is the primary search/playback resolver, followed by Audius and SoundCloud.
+Configured healthy sources are searched concurrently and the first playable result is returned.
+Each candidate is checked for relevance and unwanted alternate versions before playback. Sources
+that fail are temporarily cooled down and tried after healthy sources.
 
 Env options (all optional):
-  SOURCE_ORDER      e.g. "soundcloud,audius,youtube"   (subset / tie-break preference)
-  SAAVN_API         base URL of a JioSaavn-compatible API (enables the "saavn" source)
+  SOURCE_ORDER      e.g. "youtube,audius,soundcloud"   (subset / tie-break preference)
+  SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET  optional Spotify catalog lookup credentials
   JAMENDO_CLIENT_ID free Jamendo key (enables the "jamendo" source)
-  COOKIES_TXT / COOKIES_BASE64   YouTube cookies (default: cookies.txt next to this file)
+  COOKIES_TXT / COOKIES_BASE64   optional YouTube cookies (default: cookies.txt next to this file)\n  COOKIES_FROM_BROWSER           auto-detect an existing logged-in browser profile, or set chrome[:profile],firefox,etc.
+  ENABLE_YOUTUBE                  set to 0 to disable YouTube (enabled by default)
   RESOLVE_TIMEOUT   max seconds spent on one search (default 55)
 """
 from __future__ import annotations
@@ -65,16 +67,32 @@ def get_json(url: str, timeout: float = HTTP_TIMEOUT):
 
 
 def playable(url: str, headers: dict | None = None) -> bool:
-    """Does this stream URL actually answer? (a dead/expired/blocked URL would give silent audio)"""
+    """Verify that a URL returns readable media bytes, not just an HTTP response."""
     h = dict(headers or {})
     h.pop("Accept-Encoding", None)
-    h["Range"] = "bytes=0-2047"
+    h["Range"] = "bytes=0-4095"
     try:
         with _open(url, h) as r:
-            r.read(1)
-            return 200 <= r.status < 400
-    except urllib.error.HTTPError as e:
-        return e.code == 416
+            # A range request may be honoured (206) or ignored (200). Other statuses
+            # are not evidence of a usable stream; in particular, 416 is not playable.
+            if r.status not in (200, 206):
+                return False
+            content_type = (r.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if content_type in {"text/html", "application/json", "text/json", "application/xml"}:
+                return False
+            chunk = r.read(4096)
+            if not chunk:
+                return False
+            probe = chunk.lstrip().lower()
+            if probe.startswith((b"<!doctype html", b"<html", b"{", b"[{")):
+                return False
+            # Some providers label HLS manifests as text/plain; accept them only
+            # when the body is actually an HLS playlist.
+            if content_type == "text/plain" and not probe.startswith(b"#extm3u"):
+                return False
+            return True
+    except urllib.error.HTTPError:
+        return False
     except Exception:
         return False
 
@@ -82,21 +100,26 @@ def playable(url: str, headers: dict | None = None) -> bool:
 def _finish(info: dict) -> dict:
     if not info.get("url"):
         raise RuntimeError("no stream url")
+    # Reject formats explicitly identified as low quality. Unknown metadata is
+    # allowed because some providers do not publish bitrate/sample-rate fields.
+    try:
+        abr = float(info.get("abr") or 0)
+        if abr and abr < 128:
+            raise RuntimeError(f"{info.get('source')}: audio bitrate below 128 kbps ({abr:.0f} kbps)")
+        asr = int(info.get("asr") or 0)
+        if asr and asr < 32000:
+            raise RuntimeError(f"{info.get('source')}: sample rate too low ({asr} Hz)")
+    except (TypeError, ValueError):
+        pass
     headers = info.get("headers") or {}
     if not playable(info["url"], headers):
         raise RuntimeError(f"{info.get('source')}: stream not reachable")
-    if len(headers) > 1:
-        items = list(headers.items())
-        first_name, first_value = items[0]
-        info["headers"] = {
-            first_name: first_value + "".join(
-                f"\r\n{name}: {value}" for name, value in items[1:]
-            ) + "\r\n"
-        }
+    # MediaStream expects a mapping of individual HTTP header names to values.
+    # Keep them separate: folding Referer/Accept into User-Agent creates one invalid header.
     return info
 
 
-_STOP = {"official", "video", "audio", "lyrics", "lyric", "song", "full", "new", "hd", "the", "a", "of", "ft", "feat", "and"}
+_STOP = {"official", "video", "audio", "lyrics", "lyric", "song", "full", "new", "hd", "the", "a", "of", "ft", "feat", "and", "by", "original", "version"}
 
 
 def _tokens(s: str) -> set[str]:
@@ -104,12 +127,66 @@ def _tokens(s: str) -> set[str]:
 
 
 def _relevant(query: str, title: str, artist: str = "") -> bool:
-    """Cheap guard so a fallback source doesn't play a totally different song."""
+    """Fail closed on weak matches: title + artist must identify the requested recording."""
     q = _tokens(query)
     if not q:
-        return True
+        return False
     have = _tokens(f"{title} {artist}")
-    return len(q & have) / len(q) >= 0.5
+    return len(q & have) / len(q) >= 0.75
+
+
+_VARIANT = re.compile(
+    r"\b(?:mix(?:es)?|remix(?:es)?|mashup|medley|tiktok|reprised?|"
+    r"female\s+version|male\s+version|acoustic(?:\s+version)?|piano\s+version|"
+    r"lo[ -]?fi|fan[ -]?made|bootleg|rework|flip|sped\s*up|slowed(?:\s*\+\s*reverb)?|"
+    r"nightcore|8d|karaoke|cover|live|instrumental|bass\s*boosted|extended|dj\s*set|"
+    r"lyrics?\s*video)\b", re.I
+)
+
+
+def _variant_unwanted(query: str, title: str, artist: str = "") -> bool:
+    """Reject alternate edits named in either the title or the publishing channel."""
+    if _VARIANT.search(query):
+        return False
+    return bool(_VARIANT.search(f"{title} {artist}"))
+
+
+def _match_score(query: str, title: str, artist: str = "") -> float:
+    q = _tokens(query)
+    t = _tokens(title)
+    a = _tokens(artist)
+    if not q:
+        return 0.0
+    overlap = len(q & (t | a)) / len(q)
+    title_overlap = len(q & t) / len(q)
+    score = overlap * 5 + title_overlap * 2
+    if q == t:
+        score += 5
+    if _variant_unwanted(query, title, artist):
+        score -= 20
+    return score
+
+
+def _validate_cookie_domains(data: str) -> None:
+    """Reject cookie exports containing credentials for unrelated services."""
+    allowed = {
+        "google.com", "www.google.com", "accounts.google.com", "ogs.google.com",
+        "youtube.com", "www.youtube.com", "m.youtube.com",
+    }
+    found = 0
+    for line_no, raw in enumerate(data.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#") and not line.startswith("#HttpOnly_"):
+            continue
+        fields = line.split("\\t")
+        if len(fields) != 7:
+            raise ValueError(f"invalid Netscape cookie row at line {line_no}")
+        domain = fields[0].removeprefix("#HttpOnly_").lstrip(".").lower()
+        if domain not in allowed:
+            raise ValueError(f"cookie export contains an unrelated domain at line {line_no}")
+        found += 1
+    if not found:
+        raise ValueError("cookie export contains no supported Google/YouTube cookies")
 
 
 def _prepare_cookies() -> str | None:
@@ -126,8 +203,9 @@ def _prepare_cookies() -> str | None:
             src = os.path.join(ROOT, "cookies.txt")
             if not os.path.exists(src):
                 return None
-            shutil.copyfile(src, dst)
-            return dst
+            with open(src, "r", encoding="utf-8") as f:
+                data = f.read()
+        _validate_cookie_domains(data)
         with open(dst, "w", encoding="utf-8") as f:
             f.write(data)
         return dst
@@ -139,9 +217,38 @@ def _prepare_cookies() -> str | None:
 COOKIES = _prepare_cookies()
 
 
-def _ydl_opts(cookies: bool = True, clients: list[str] | None = None) -> dict:
+def _browser_cookie_specs() -> list[tuple[str, str | None, None, None]]:
+    """Find existing logged-in browser profiles; this reads sessions, it cannot create logins."""
+    setting = os.environ.get("COOKIES_FROM_BROWSER", "auto").strip()
+    known = {
+        "chrome": os.path.expanduser("~/.config/google-chrome"),
+        "chromium": os.path.expanduser("~/.config/chromium"),
+        "firefox": os.path.expanduser("~/.mozilla/firefox"),
+        "edge": os.path.expanduser("~/.config/microsoft-edge"),
+        "brave": os.path.expanduser("~/.config/BraveSoftware/Brave-Browser"),
+        "opera": os.path.expanduser("~/.config/opera"),
+        "vivaldi": os.path.expanduser("~/.config/vivaldi"),
+    }
+    specs = []
+    if not setting or setting.lower() in {"0", "false", "off", "none"}:
+        return specs
+    entries = list(known) if setting.lower() == "auto" else [x.strip() for x in setting.split(",") if x.strip()]
+    for entry in entries:
+        browser, sep, profile = entry.partition(":")
+        browser = browser.lower()
+        if browser not in known:
+            log("ignoring unsupported COOKIES_FROM_BROWSER entry:", browser)
+            continue
+        if setting.lower() == "auto" and not os.path.isdir(known[browser]):
+            continue
+        specs.append((browser, profile or None, None, None))
+    return specs
+
+
+def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
+              browser: tuple[str, str | None, None, None] | None = None) -> dict:
     o = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[acodec!=none]/best[acodec!=none]/best",
         "js_runtimes": {"deno": {}, "node": {}},
         "remote_components": ["ejs:github"],
         "noplaylist": True,
@@ -154,6 +261,8 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None) -> dict:
     }
     if cookies and COOKIES:
         o["cookiefile"] = COOKIES
+    elif browser:
+        o["cookiesfrombrowser"] = browser
     if clients:
         o["extractor_args"] = {"youtube": {"player_client": clients}}
     return o
@@ -176,8 +285,11 @@ def _norm(info: dict, source: str) -> dict:
         "url": info.get("url"),
         "page": info.get("webpage_url") or info.get("original_url") or "",
         "duration": int(info.get("duration") or 0),
-        "artist": info.get("artist") or info.get("uploader") or info.get("channel") or "",
+        "artist": info.get("artist") or info.get("creator") or info.get("uploader") or info.get("channel") or "",
         "headers": info.get("http_headers") or {},
+        "abr": info.get("abr"),
+        "asr": info.get("asr"),
+        "acodec": info.get("acodec"),
         "source": source,
     }
 
@@ -194,13 +306,54 @@ YT_ATTEMPTS = [
 
 def _youtube(target: str) -> dict:
     last: Exception | None = None
-    for a in YT_ATTEMPTS:
+    # Search results must pass the same title/variant checks as other sources.
+    # Direct user-provided YouTube links are intentionally resolved as requested.
+    search_query = None
+    m = re.match(r"ytsearch\d*:(.*)", target, re.I)
+    if m:
+        search_query = m.group(1).strip()
+    attempts = list(YT_ATTEMPTS)
+    # If ordinary extraction is challenged, try importing an already-authenticated
+    # browser profile. This cannot create a Google login or bypass verification.
+    for browser_spec in _browser_cookie_specs():
+        attempts.append({"browser": browser_spec, "cookies": False})
+    if not COOKIES:
+        specs = _browser_cookie_specs()
+        if not specs:
+            log("no YouTube cookie file or logged-in browser profile found; "
+                "set COOKIES_BASE64/COOKIES_TXT or provide an authenticated browser profile")
+    for a in attempts:
         try:
-            entries = _ydl_entries(_ydl_opts(a.get("cookies", True), a.get("clients")), target)
-            info = _norm(entries[0], "youtube")
-            return _finish(info)  # unreachable URL -> try the next YouTube client
-        except NotFound:
-            raise
+            entries = _ydl_entries(
+                _ydl_opts(a.get("cookies", True), a.get("clients"), a.get("browser")), target
+            )
+            if search_query:
+                entries = sorted(
+                    entries,
+                    key=lambda e: _match_score(
+                        search_query, e.get("title", ""),
+                        e.get("artist") or e.get("uploader") or e.get("channel", "")
+                    ),
+                    reverse=True,
+                )
+            for entry in entries:
+                info = _norm(entry, "youtube")
+                if search_query and (
+                    not _relevant(search_query, info["title"], info["artist"])
+                    or _variant_unwanted(search_query, info["title"], info["artist"])
+                    or _match_score(search_query, info["title"], info["artist"]) < 5.0
+                ):
+                    continue
+                try:
+                    return _finish(info)
+                except Exception as e:
+                    last = e
+            if search_query:
+                last = NotFound("youtube: no acceptable search result")
+                continue
+        except NotFound as e:
+            last = e
+            continue
         except Exception as e:
             last = e
             log("youtube attempt failed:", str(e)[:160])
@@ -209,11 +362,14 @@ def _youtube(target: str) -> dict:
 
 def _soundcloud(q: str) -> dict:
     last: Exception | None = None
-    for e in _ydl_entries(_ydl_opts(cookies=False), f"scsearch3:{q}"):
+    entries = _ydl_entries(_ydl_opts(cookies=False), f"scsearch10:{q}")
+    candidates = sorted(entries, key=lambda e: _match_score(
+        q, e.get("title", ""), e.get("artist") or e.get("uploader", "")), reverse=True)
+    for e in candidates:
         if "preview" in f"{e.get('format_note', '')} {e.get('format_id', '')}".lower():
-            continue  # 30-second Go+ preview, not the song
+            continue
         info = _norm(e, "soundcloud")
-        if not _relevant(q, info["title"], info["artist"]):
+        if not _relevant(q, info["title"], info["artist"]) or _variant_unwanted(q, info["title"], info["artist"]):
             continue
         try:
             return _finish(info)
@@ -263,7 +419,8 @@ def _audius(q: str) -> dict:
                 track_key = (host, track_id)
                 artist = (t.get("user") or {}).get("name", "")
                 if (not track_id or track_key in seen or t.get("is_streamable") is False
-                        or not _relevant(q, t.get("title", ""), artist)):
+                        or not _relevant(q, t.get("title", ""), artist)
+                        or _variant_unwanted(q, t.get("title", ""), artist)):
                     continue
                 seen.add(track_key)
                 try:
@@ -293,16 +450,65 @@ def _jamendo(q: str) -> dict:
     raise NotFound("jamendo: no relevant result")
 
 
-def _saavn(q: str) -> dict:
-    base = os.environ["SAAVN_API"].rstrip("/")
-    d = get_json(f"{base}/search/songs?query={urllib.parse.quote(q)}&limit=5")
-    for r in (d.get("data") or {}).get("results") or []:
-        dl = [x for x in (r.get("downloadUrl") or []) if x.get("url")]
-        names = ", ".join(a.get("name", "") for a in ((r.get("artists") or {}).get("primary") or []))
-        if dl and _relevant(q, r.get("name", ""), names):
-            return _finish({"title": r.get("name") or "Unknown", "url": dl[-1]["url"], "page": r.get("url", ""),
-                            "duration": int(r.get("duration") or 0), "artist": names, "headers": {}, "source": "saavn"})
-    raise NotFound("saavn: no relevant result")
+# ───────────────────────── Spotify catalogue lookup ─────────────────────────
+_spotify_token_cache = {"token": "", "expires": 0.0}
+
+
+def _spotify_catalog_query(q: str) -> str:
+    """Use Spotify Web API for canonical title/artist matching only, never for audio streams."""
+    client_id = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        return q
+
+    try:
+        cached = _spotify_token_cache
+        if cached["token"] and time.time() < cached["expires"] - 30:
+            token = cached["token"]
+        else:
+            credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+            request = urllib.request.Request(
+                "https://accounts.spotify.com/api/token",
+                data=urllib.parse.urlencode({"grant_type": "client_credentials"}).encode(),
+                headers={
+                    "Authorization": f"Basic {credentials}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": UA,
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+                auth = json.loads(response.read(100_000).decode("utf-8", "replace"))
+            token = auth["access_token"]
+            _spotify_token_cache.update(token=token, expires=time.time() + int(auth.get("expires_in", 3600)))
+
+        params = urllib.parse.urlencode({"q": q, "type": "track", "market": "IN", "limit": 10})
+        request = urllib.request.Request(
+            f"https://api.spotify.com/v1/search?{params}",
+            headers={"Authorization": f"Bearer {token}", "User-Agent": UA},
+        )
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            data = json.loads(response.read(1_000_000).decode("utf-8", "replace"))
+
+        tracks = (data.get("tracks") or {}).get("items") or []
+        candidates = []
+        for track in tracks:
+            name = track.get("name") or ""
+            artists = ", ".join(a.get("name", "") for a in track.get("artists", []) if a.get("name"))
+            if (not name or not _relevant(q, name, artists)
+                    or _variant_unwanted(q, name, artists)):
+                continue
+            candidates.append((_match_score(q, name, artists), name, artists))
+        if not candidates:
+            return q
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        _, name, artists = candidates[0]
+        canonical = f"{name} {artists}".strip()
+        log(f"Spotify catalogue match: {canonical}")
+        return canonical
+    except Exception as e:
+        log("Spotify catalogue lookup unavailable; using original query:", str(e)[:140])
+        return q
 
 
 # ───────────────────────── registry ─────────────────────────
@@ -325,12 +531,20 @@ class Source:
 
 
 def _build() -> list[Source]:
-    s = [Source("soundcloud", _soundcloud), Source("audius", _audius)]
-    if os.environ.get("SAAVN_API"):
-        s.append(Source("saavn", _saavn))
-    if os.environ.get("JAMENDO_CLIENT_ID"):
-        s.append(Source("jamendo", _jamendo))
-    s.append(Source("youtube", lambda q: _youtube(f"ytsearch1:{q}")))
+    # YouTube is the primary playback resolver by default. Set ENABLE_YOUTUBE=0 to disable it.
+    s = []
+    # Spotify is used only to identify the canonical track; it does not provide audio streams.
+    youtube_enabled = os.environ.get("ENABLE_YOUTUBE", "1").strip().lower() in {"1", "true", "yes", "on"}
+    if youtube_enabled:
+        s.append(Source("youtube", lambda q: _youtube(f"ytsearch10:{q}")))
+    # Alternate user uploads are disabled by default: they often return covers,
+    # edits, or low-quality copies. Enable only as an explicit last-resort choice.
+    if os.environ.get("ENABLE_ALTERNATE_SOURCES", "").strip().lower() in {"1", "true", "yes", "on"}:
+        s.extend([Source("audius", _audius), Source("soundcloud", _soundcloud)])
+        if os.environ.get("JAMENDO_CLIENT_ID"):
+            s.append(Source("jamendo", _jamendo))
+    if not s:
+        raise RuntimeError("No music sources enabled")
     order = [x.strip() for x in os.environ.get("SOURCE_ORDER", "").split(",") if x.strip()]
     if order:
         by = {x.name: x for x in s}
@@ -419,6 +633,8 @@ def resolve(query: str, skip=()) -> dict:
             raise Unavailable(errors or ["could not read that link"])
         log("link failed/unsupported, searching other sources for:", hint)
         query = hint
+
+    query = _spotify_catalog_query(query)
 
     ordered = [s for s in SOURCES if s.name not in skip]
     healthy = [s for s in ordered if s.alive]

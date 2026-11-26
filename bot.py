@@ -6,6 +6,7 @@ LOOP = asyncio.new_event_loop()
 asyncio.set_event_loop(LOOP)
 
 import html
+import logging
 import json
 import os
 import random
@@ -25,6 +26,7 @@ if _missing:
     sys.exit(2)
 
 from pyrogram import Client, filters, idle
+from pyrogram.errors import FloodWait
 from pyrogram.raw import functions
 from pyrogram.raw.types import InputStickerSetShortName
 from pyrogram.types import (
@@ -34,19 +36,32 @@ from pyrogram.types import (
 from pytgcalls import PyTgCalls, filters as call_filters
 from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
 
+# FFmpeg DEBUG output floods the logs (HLS reconnect/playlist lines many times a second).
+logging.getLogger('ffmpeg').setLevel(logging.WARNING)
+
 import sources
+from seek import parse_seek_position
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SESSION = os.environ["SESSION_STRING"]  # assistant account that joins the voice chat
 
-# in_memory: nothing is written to disk, so restarts/redeploys on Railway never hit a stale session file
-bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, sleep_threshold=60)
+# Every fresh bot login (auth.ImportBotAuthorization) counts toward Telegram's flood limit, and each
+# Railway deploy used to start with a brand-new in-memory session. Keep the bot session on disk
+# when a persistent directory exists (mount a Railway volume at /data, or set BOT_SESSION_DIR) so
+# redeploys and restarts reuse it instead of logging in again.
+_sess_dir = os.environ.get("BOT_SESSION_DIR") or ("/data" if os.path.isdir("/data") else "")
+if _sess_dir and not os.access(_sess_dir, os.W_OK):
+    _sess_dir = ""
+if _sess_dir:
+    bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir=_sess_dir, sleep_threshold=60)
+else:
+    print("No persistent session dir (/data or BOT_SESSION_DIR): bot logs in fresh on every start.", flush=True)
+    bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True, sleep_threshold=60)
 assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH, session_string=SESSION,
                    in_memory=True, sleep_threshold=60)
 calls = PyTgCalls(assistant)
-
 
 @dataclass
 class Track:
@@ -57,6 +72,7 @@ class Track:
     by: str
     artist: str = ""
     headers: dict = field(default_factory=dict)
+    ffmpeg_parameters: str | None = None
     started: float = 0.0
     paused_at: float = 0.0
     msg: int = 0
@@ -239,22 +255,71 @@ async def updater(t: Track):
         pass
 
 
-async def start_stream(chat_id: int, t: Track):
+async def start_stream(chat_id: int, t: Track, seek_to: int | None = None):
+    ffmpeg_parameters = t.ffmpeg_parameters
+    if seek_to is not None:
+        ffmpeg_parameters = f"{ffmpeg_parameters or ''} --audio --start -ss {seek_to}".strip()
     kw = dict(
         audio_parameters=AudioQuality.STUDIO,  # 48 kHz stereo, top quality
         video_flags=MediaStream.Flags.IGNORE,
+        ffmpeg_parameters=ffmpeg_parameters,
     )
-    try:
-        stream = MediaStream(t.url, headers=t.headers, **kw)  # YouTube links need their request headers
-    except TypeError:
-        stream = MediaStream(t.url, **kw)
+    # Preserve provider headers; silently dropping Referer/User-Agent can turn a valid
+    # stream into an HTTP error or an apparently silent playback.
+    stream = MediaStream(t.url, headers=t.headers, **kw)
     try:
         await calls.play(chat_id, stream)
     except Exception as e:
         print("calls.play failed:", repr(e), flush=True)
         raise
-    t.started = time.time()
+    t.started = time.time() - (seek_to or 0)
     t.paused_at = 0.0
+
+
+def _is_call_setup_error(error: Exception) -> bool:
+    """Do not switch audio providers for Telegram voice-chat permission/state errors."""
+    name = type(error).__name__.lower()
+    message = str(error).lower()
+    known_types = (
+        "groupcall", "chatadminrequired", "usernotparticipant",
+        "peeridinvalid", "channelprivate", "userbannedinchannel",
+    )
+    known_messages = (
+        "voice chat is not active", "group call is not active",
+        "not a participant", "chat admin required", "peer id invalid",
+    )
+    return any(token in name for token in known_types) or any(
+        token in message for token in known_messages
+    )
+
+
+async def start_with_fallback(chat_id: int, t: Track):
+    """Start this exact requested track; on media failure, retry other providers only."""
+    attempts = max(1, len(sources.SOURCES))
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            # A caller may have marked the just-ended provider bad before entering here.
+            if t.source and t.source in t.bad:
+                await reresolve(t)
+            else:
+                await ensure_fresh(t)
+            await start_stream(chat_id, t)
+            return
+        except Exception as e:
+            if _is_call_setup_error(e):
+                raise
+            last_error = e
+            if t.source:
+                t.bad.add(t.source)
+            if attempt + 1 >= attempts:
+                break
+            try:
+                await reresolve(t)
+            except Exception as resolve_error:
+                last_error = resolve_error
+                break
+    raise RuntimeError(f"all available audio sources failed: {last_error}") from last_error
 
 
 async def announce(chat_id: int, t: Track):
@@ -292,8 +357,7 @@ async def play_next(chat_id: int, force: bool = False):
     q = queues.get(chat_id, [])
     if q and loop.get(chat_id) and not force:
         try:
-            await ensure_fresh(q[0])
-            await start_stream(chat_id, q[0])  # replay same track, same card
+            await start_with_fallback(chat_id, q[0])  # replay same track, same card
             return
         except Exception as e:
             print("loop replay failed:", repr(e)[:200], flush=True)
@@ -308,8 +372,7 @@ async def play_next(chat_id: int, force: bool = False):
             await leave(chat_id)
             return
         try:
-            await ensure_fresh(q[0])
-            await start_stream(chat_id, q[0])
+            await start_with_fallback(chat_id, q[0])
             await announce(chat_id, q[0])
             return
         except Exception as e:
@@ -329,8 +392,7 @@ async def handle_end(chat_id: int):
         t.bad.add(t.source)
         print(f"stream died right away ({t.source}), trying another source (try {t.retries})", flush=True)
         try:
-            await reresolve(t)
-            await start_stream(chat_id, t)
+            await start_with_fallback(chat_id, t)
             return
         except Exception as e:
             print("no other source worked:", repr(e)[:200], flush=True)
@@ -366,7 +428,7 @@ async def act(chat_id: int, action: str) -> str:
             return "No previous song."
         finish(cur)
         q.insert(0, h.pop())
-        await start_stream(chat_id, q[0])
+        await start_with_fallback(chat_id, q[0])
         await announce(chat_id, q[0])
         return "⏮ Previous"
     if action == "shuffle":
@@ -395,6 +457,43 @@ async def act(chat_id: int, action: str) -> str:
     return ""
 
 
+@bot.on_message(filters.command("mxseek") & filters.group)
+async def seek_track(_, m: Message):
+    if len(m.command) != 2:
+        return await m.reply_text("Usage: /mxseek <seconds|MM:SS|HH:MM:SS>")
+    try:
+        target = parse_seek_position(m.command[1])
+    except ValueError:
+        return await m.reply_text("Usage: /mxseek <seconds|MM:SS|HH:MM:SS>")
+
+    q = queues.get(m.chat.id)
+    if not q:
+        return await m.reply_text("Nothing is playing.")
+    cur = q[0]
+
+    try:
+        await ensure_fresh(cur)
+    except Exception as e:
+        print("/mxseek could not refresh the stream:", repr(e)[:200], flush=True)
+        return await m.reply_text("Couldn't refresh the current stream to seek.")
+
+    if cur.duration and target >= cur.duration:
+        return await m.reply_text(f"Choose a position before {fmt(cur.duration)}.")
+
+    was_paused = bool(cur.paused_at)
+    try:
+        await start_stream(m.chat.id, cur, seek_to=target)
+        if was_paused:
+            await calls.pause(m.chat.id)
+            cur.paused_at = time.time()
+        await refresh(m.chat.id, cur)
+    except Exception as e:
+        print("/mxseek failed:", repr(e)[:200], flush=True)
+        return await m.reply_text("Couldn't seek this stream. It may not support seeking.")
+
+    await m.reply_text(f"⏩ Seeked to {fmt(target)}.")
+
+
 @calls.on_update(call_filters.stream_end(StreamEnded.Type.AUDIO))
 async def on_end(_, update: StreamEnded):
     try:
@@ -409,8 +508,16 @@ async def play_query(m: Message, force: bool = False):
     if not query and m.reply_to_message:
         query = (m.reply_to_message.text or "").strip()
     if not query:
-        command = "/mxplayforce" if force else "/play"
+        command = "/mxplayforce" if force else "/mxstartplay"
         return await m.reply_text(f"Usage: {command} song name or link")
+
+    # The assistant must be a group member before it can join that group's voice chat.
+    if not await ensure_assistant_in_group(m.chat.id):
+        return await m.reply_text(
+            "I couldn't add the assistant account to this group. "
+            "Please make the music bot an admin with permission to invite users, "
+            "then try /mxplay again."
+        )
 
     status = await m.reply_text("Searching…")
     try:
@@ -449,17 +556,7 @@ async def play_query(m: Message, force: bool = False):
 
     if force or len(q) == 1:
         try:
-            try:
-                await start_stream(m.chat.id, t)
-            except Exception as e:
-                call_problem = any(w in str(e).lower() + type(e).__name__.lower()
-                                   for w in ("group", "call", "voice", "peer", "participant", "admin", "forbidden"))
-                if call_problem:
-                    raise
-                print("start failed, trying another source:", repr(e)[:200], flush=True)
-                t.bad.add(t.source)
-                await reresolve(t)
-                await start_stream(m.chat.id, t)
+            await start_with_fallback(m.chat.id, t)
         except Exception as e:
             q.clear()
             return await status.edit_text(f"Couldn't start playback. Make sure a voice chat is open and the assistant is in the group.\n{e}")
@@ -471,7 +568,7 @@ async def play_query(m: Message, force: bool = False):
                                   "text": f"{pe('queue')} <b>QUEUED #{len(q) - 1}</b>\n\n<b>{html.escape(t.title)}</b>\n{pe('user')} {html.escape(t.by)}"})
 
 
-@bot.on_message(filters.command("play") & filters.group)
+@bot.on_message(filters.command(["mxplay", "mxstartplay"]) & filters.group)
 async def play(_, m: Message):
     await play_query(m)
 
@@ -479,6 +576,33 @@ async def play(_, m: Message):
 @bot.on_message(filters.command("mxplayforce") & filters.group)
 async def mxplayforce(_, m: Message):
     await play_query(m, force=True)
+
+
+@bot.on_message(filters.command("mxtestaudio") & filters.group)
+async def test_audio(_, m: Message):
+    if queues.get(m.chat.id):
+        return await m.reply_text("Stop current playback with /mxstopplay, then run /mxtestaudio.")
+    status = await m.reply_text("Starting an 8-second audio test…")
+    t = Track(
+        title="440 Hz audio test",
+        url="sine=frequency=440:duration=8",
+        page="",
+        duration=8,
+        by=m.from_user.first_name if m.from_user else "Unknown",
+        source="test tone",
+        ffmpeg_parameters="--audio --start -f lavfi",
+        resolved_at=time.time(),
+    )
+    q = queues.setdefault(m.chat.id, [])
+    q.append(t)
+    try:
+        await start_stream(m.chat.id, t)
+        await status.delete()
+        await announce(m.chat.id, t)
+    except Exception as e:
+        q.clear()
+        print("audio test failed:", repr(e)[:200], flush=True)
+        await status.edit_text("The audio test could not start. Check the voice chat and Railway logs.")
 
 
 def _cmd(name: str, action: str):
@@ -492,8 +616,9 @@ def _cmd(name: str, action: str):
         await m.reply_text(text)
 
 
-for _n, _a in (("pause", "pause"), ("resume", "resume"), ("skip", "skip"),
-               ("stop", "stop"), ("prev", "prev"), ("shuffle", "shuffle"), ("loop", "loop")):
+for _n, _a in (("mxpause", "pause"), ("mxresume", "resume"), ("mxskip", "skip"),
+               ("mxstopplay", "stop"), ("mxprevious", "prev"), ("mxshuffle", "shuffle"),
+               ("mxloop", "loop")):
     _cmd(_n, _a)
 
 
@@ -506,7 +631,7 @@ async def buttons(_, cq: CallbackQuery):
     await cq.answer(text)
 
 
-@bot.on_message(filters.command("queue") & filters.group)
+@bot.on_message(filters.command("mxqueue") & filters.group)
 async def show_queue(_, m: Message):
     q = queues.get(m.chat.id)
     if not q:
@@ -534,9 +659,92 @@ async def watchdog():
                 os._exit(1)
 
 
+async def ensure_assistant_in_group(chat_id: int) -> bool:
+    """Join the assistant user account using a temporary invite link created by the bot."""
+    try:
+        await assistant.get_chat(chat_id)
+        return True
+    except Exception as lookup_error:
+        print(f"assistant is not in group {chat_id}: {type(lookup_error).__name__}", flush=True)
+
+    invite = None
+    try:
+        invite = await bot.create_chat_invite_link(
+            chat_id, name="Music assistant auto-join"
+        )
+        await assistant.join_chat(invite.invite_link)
+        # Confirm membership; join-request-only groups must not be treated as joined.
+        await assistant.get_chat(chat_id)
+        print(f"assistant joined group {chat_id}", flush=True)
+        return True
+    except Exception as e:
+        print(f"assistant could not join group {chat_id}: {repr(e)[:240]}", flush=True)
+        return False
+    finally:
+        if invite is not None:
+            try:
+                await bot.revoke_chat_invite_link(chat_id, invite.invite_link)
+            except Exception as revoke_error:
+                print(f"temporary invite cleanup failed: {repr(revoke_error)[:120]}", flush=True)
+
+
+@bot.on_chat_member_updated()
+async def on_bot_group_membership(_, update):
+    """When this bot is added to a group, invite the assistant account into it first."""
+    try:
+        me = await bot.get_me()
+        member = getattr(update, "new_chat_member", None)
+        user = getattr(member, "user", None)
+        if not user or user.id != me.id:
+            return
+        status = getattr(member, "status", "")
+        status = getattr(status, "value", status)
+        if str(status).lower() not in ("member", "administrator"):
+            return
+        chat = update.chat
+        chat_type = getattr(chat, "type", "")
+        chat_type = getattr(chat_type, "value", chat_type)
+        if str(chat_type).lower() not in ("group", "supergroup"):
+            return
+        if not await ensure_assistant_in_group(chat.id):
+            print(
+                f"assistant auto-join needs the bot to be an admin in group {chat.id} "
+                "so it can create an invite link",
+                flush=True,
+            )
+    except Exception as e:
+        print("automatic assistant group join failed:", repr(e)[:240], flush=True)
+
+
+async def start_with_floodwait(client, name):
+    """Start a client, sleeping out Telegram's FloodWait instead of crashing (restarts extend the ban)."""
+    while True:
+        try:
+            await client.start()
+            return
+        except FloodWait as e:
+            wait_seconds = max(int(getattr(e, "value", 0)), 1) + 5
+            print(f"Telegram FloodWait starting {name}; waiting {wait_seconds}s.", flush=True)
+            await asyncio.sleep(wait_seconds)
+
+
 async def main():
-    await bot.start()
-    await assistant.start()
+    await start_with_floodwait(bot, "bot")
+    # Telegram may temporarily rate-limit assistant-session authorization.
+    # Keep the bot client online while respecting
+    # Telegram's exact FloodWait duration instead of crashing into Railway restarts.
+    while True:
+        try:
+            await assistant.start()
+            break
+        except FloodWait as e:
+            wait_seconds = max(int(getattr(e, "value", 0)), 1) + 5
+            print(
+                f"Telegram FloodWait during assistant authorization; "
+                f"waiting {wait_seconds}s before retrying.",
+                flush=True,
+            )
+            await asyncio.sleep(wait_seconds)
     await calls.start()
     try:
         await load_emojis()
