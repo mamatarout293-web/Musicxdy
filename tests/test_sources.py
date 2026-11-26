@@ -51,5 +51,23 @@ class SourceOrderTests(unittest.TestCase):
         self.assertEqual(names, ["soundcloud", "audius", "youtube"])
 
 
+class StreamHeaderTests(unittest.TestCase):
+    @patch("sources.playable", return_value=True)
+    def test_finish_combines_headers_for_ffmpeg(self, playable):
+        headers = {
+            "User-Agent": "MusicBot/1.0",
+            "Accept": "*/*",
+            "Referer": "https://soundcloud.com/",
+        }
+        info = {"url": "https://stream.example/audio", "headers": headers, "source": "soundcloud"}
+
+        result = sources._finish(info)
+
+        playable.assert_called_once_with(info["url"], headers)
+        self.assertEqual(result["headers"], {
+            "User-Agent": "MusicBot/1.0\r\nAccept: */*\r\nReferer: https://soundcloud.com/\r\n"
+        })
+
+
 if __name__ == "__main__":
     unittest.main()

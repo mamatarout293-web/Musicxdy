@@ -82,8 +82,17 @@ def playable(url: str, headers: dict | None = None) -> bool:
 def _finish(info: dict) -> dict:
     if not info.get("url"):
         raise RuntimeError("no stream url")
-    if not playable(info["url"], info.get("headers")):
+    headers = info.get("headers") or {}
+    if not playable(info["url"], headers):
         raise RuntimeError(f"{info.get('source')}: stream not reachable")
+    if len(headers) > 1:
+        items = list(headers.items())
+        first_name, first_value = items[0]
+        info["headers"] = {
+            first_name: first_value + "".join(
+                f"\r\n{name}: {value}" for name, value in items[1:]
+            ) + "\r\n"
+        }
     return info
 
 
