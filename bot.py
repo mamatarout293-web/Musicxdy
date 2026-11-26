@@ -27,7 +27,12 @@ if _missing:
 from pyrogram import Client, filters, idle
 from pyrogram.raw import functions
 from pyrogram.raw.types import InputStickerSetShortName
-from pyrogram.types import CallbackQuery, Message
+from pyrogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    CallbackQuery,
+    Message,
+)
 from pytgcalls import PyTgCalls, filters as call_filters
 from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
 
@@ -43,6 +48,18 @@ bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_me
 assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH, session_string=SESSION,
                    in_memory=True, sleep_threshold=60)
 calls = PyTgCalls(assistant)
+
+BOT_COMMANDS = [
+    BotCommand("play", "Play a song or link"),
+    BotCommand("queue", "Show the song queue"),
+    BotCommand("pause", "Pause playback"),
+    BotCommand("resume", "Resume playback"),
+    BotCommand("skip", "Skip to the next song"),
+    BotCommand("prev", "Play the previous song"),
+    BotCommand("shuffle", "Shuffle upcoming songs"),
+    BotCommand("loop", "Toggle repeat"),
+    BotCommand("stop", "Stop playback and clear the queue"),
+]
 
 
 @dataclass
@@ -397,9 +414,10 @@ async def act(chat_id: int, action: str) -> str:
     return ""
 
 
-@calls.on_update(call_filters.stream_end)
+@calls.on_update(call_filters.stream_end(StreamEnded.Type.AUDIO))
 async def on_end(_, update: StreamEnded):
     try:
+        print(f"audio stream ended in {update.chat_id}; advancing queue", flush=True)
         await handle_end(update.chat_id)
     except Exception as e:
         print("on_end failed:", repr(e)[:200], flush=True)
@@ -542,6 +560,11 @@ async def watchdog():
 
 async def main():
     await bot.start()
+    if not await bot.set_bot_commands(
+        BOT_COMMANDS,
+        scope=BotCommandScopeAllGroupChats(),
+    ):
+        raise RuntimeError("Telegram did not accept the bot command list")
     await assistant.start()
     await calls.start()
     try:
