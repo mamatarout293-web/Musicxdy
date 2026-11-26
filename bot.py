@@ -30,8 +30,6 @@ from pyrogram.errors import FloodWait
 from pyrogram.raw import functions
 from pyrogram.raw.types import InputStickerSetShortName
 from pyrogram.types import (
-    BotCommand,
-    BotCommandScopeAllGroupChats,
     CallbackQuery,
     Message,
 )
@@ -63,21 +61,6 @@ else:
 assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH, session_string=SESSION,
                    in_memory=True, sleep_threshold=60)
 calls = PyTgCalls(assistant)
-
-BOT_COMMANDS = [
-    BotCommand("mxstartplay", "Start playing a song or link"),
-    BotCommand("mxplay", "Play or queue a song"),
-    BotCommand("mxqueue", "Show the music queue"),
-    BotCommand("mxpause", "Pause music"),
-    BotCommand("mxresume", "Resume music"),
-    BotCommand("mxskip", "Skip the current song"),
-    BotCommand("mxprevious", "Play the previous song"),
-    BotCommand("mxshuffle", "Shuffle upcoming songs"),
-    BotCommand("mxloop", "Toggle repeat"),
-    BotCommand("mxstopplay", "Stop music and clear the queue"),
-    BotCommand("mxtestaudio", "Test Telegram voice-chat audio"),
-]
-
 
 @dataclass
 class Track:
@@ -687,13 +670,8 @@ async def start_with_floodwait(client, name):
 
 async def main():
     await start_with_floodwait(bot, "bot")
-    if not await bot.set_bot_commands(
-        BOT_COMMANDS,
-        scope=BotCommandScopeAllGroupChats(),
-    ):
-        raise RuntimeError("Telegram did not accept the bot command list")
     # Telegram may temporarily rate-limit assistant-session authorization.
-    # Keep the bot client online (and its commands registered) while respecting
+    # Keep the bot client online while respecting
     # Telegram's exact FloodWait duration instead of crashing into Railway restarts.
     while True:
         try:
