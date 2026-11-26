@@ -238,7 +238,8 @@ async def updater(t: Track):
 
 async def start_stream(chat_id: int, t: Track):
     kw = dict(
-        audio_parameters=AudioQuality.STUDIO,  # 48 kHz stereo, top quality
+        audio_parameters=AudioQuality.STUDIO,  # 96 kHz stereo
+        audio_flags=MediaStream.Flags.REQUIRED,
         video_flags=MediaStream.Flags.IGNORE,
     )
     try:
