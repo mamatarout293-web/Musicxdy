@@ -40,6 +40,7 @@ from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
 logging.getLogger('ffmpeg').setLevel(logging.WARNING)
 
 import sources
+from seek import parse_seek_position
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -254,12 +255,15 @@ async def updater(t: Track):
         pass
 
 
-async def start_stream(chat_id: int, t: Track):
+async def start_stream(chat_id: int, t: Track, seek_to: int | None = None):
+    ffmpeg_parameters = t.ffmpeg_parameters
+    if seek_to is not None:
+        ffmpeg_parameters = f"{ffmpeg_parameters or ''} --audio --start -ss {seek_to}".strip()
     kw = dict(
         audio_parameters=AudioQuality.HIGH,  # 48 kHz stereo
         audio_flags=MediaStream.Flags.REQUIRED,
         video_flags=MediaStream.Flags.IGNORE,
-        ffmpeg_parameters=t.ffmpeg_parameters,
+        ffmpeg_parameters=ffmpeg_parameters,
     )
     # Preserve provider headers; silently dropping Referer/User-Agent can turn a valid
     # stream into an HTTP error or an apparently silent playback.
@@ -271,7 +275,7 @@ async def start_stream(chat_id: int, t: Track):
         print("calls.play failed:", repr(e), flush=True)
         raise
     print(f"audio stream started: {t.source} ({t.title}); unmute={unmuted}", flush=True)
-    t.started = time.time()
+    t.started = time.time() - (seek_to or 0)
     t.paused_at = 0.0
 
 
@@ -454,6 +458,43 @@ async def act(chat_id: int, action: str) -> str:
                                       "reply_markup": {"inline_keyboard": []}})
         return "⏹ Stopped"
     return ""
+
+
+@bot.on_message(filters.command("mxseek") & filters.group)
+async def seek_track(_, m: Message):
+    if len(m.command) != 2:
+        return await m.reply_text("Usage: /mxseek <seconds|MM:SS|HH:MM:SS>")
+    try:
+        target = parse_seek_position(m.command[1])
+    except ValueError:
+        return await m.reply_text("Usage: /mxseek <seconds|MM:SS|HH:MM:SS>")
+
+    q = queues.get(m.chat.id)
+    if not q:
+        return await m.reply_text("Nothing is playing.")
+    cur = q[0]
+
+    try:
+        await ensure_fresh(cur)
+    except Exception as e:
+        print("/mxseek could not refresh the stream:", repr(e)[:200], flush=True)
+        return await m.reply_text("Couldn't refresh the current stream to seek.")
+
+    if cur.duration and target >= cur.duration:
+        return await m.reply_text(f"Choose a position before {fmt(cur.duration)}.")
+
+    was_paused = bool(cur.paused_at)
+    try:
+        await start_stream(m.chat.id, cur, seek_to=target)
+        if was_paused:
+            await calls.pause(m.chat.id)
+            cur.paused_at = time.time()
+        await refresh(m.chat.id, cur)
+    except Exception as e:
+        print("/mxseek failed:", repr(e)[:200], flush=True)
+        return await m.reply_text("Couldn't seek this stream. It may not support seeking.")
+
+    await m.reply_text(f"⏩ Seeked to {fmt(target)}.")
 
 
 @calls.on_update(call_filters.stream_end(StreamEnded.Type.AUDIO))

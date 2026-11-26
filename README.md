@@ -45,10 +45,11 @@ All group commands use the `/mx` prefix so they are less likely to collide with 
 - `/mxplay <song or link>` — alias for start/play
 - `/mxstopplay` — stop playback and clear the queue
 - `/mxpause`, `/mxresume`, `/mxskip`, `/mxprevious`
+- `/mxseek <seconds|MM:SS|HH:MM:SS>` — seek in the current song
 - `/mxqueue`, `/mxshuffle`, `/mxloop`
 - `/mxtestaudio` — test Telegram voice-chat audio
 
-The old generic commands (`/play`, `/stop`, etc.) are no longer registered. Inline player buttons continue to work.
+Commands are handled by the bot but aren't added to Telegram's command menu automatically; add them manually if you want them listed there. The old generic commands (`/play`, `/stop`, etc.) are not handled. Inline player buttons continue to work.
 
 The bot can only play streams a provider makes publicly available to it. It cannot guarantee every
 song or subscriber/premium quality, and it does not bypass login, DRM, or provider bot restrictions.
