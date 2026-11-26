@@ -28,8 +28,6 @@ from pyrogram import Client, filters, idle
 from pyrogram.raw import functions
 from pyrogram.raw.types import InputStickerSetShortName
 from pyrogram.types import (
-    BotCommand,
-    BotCommandScopeAllGroupChats,
     CallbackQuery,
     Message,
 )
@@ -49,17 +47,6 @@ assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH, session_string
                    in_memory=True, sleep_threshold=60)
 calls = PyTgCalls(assistant)
 
-BOT_COMMANDS = [
-    BotCommand("play", "Play a song or link"),
-    BotCommand("queue", "Show the song queue"),
-    BotCommand("pause", "Pause playback"),
-    BotCommand("resume", "Resume playback"),
-    BotCommand("skip", "Skip to the next song"),
-    BotCommand("prev", "Play the previous song"),
-    BotCommand("shuffle", "Shuffle upcoming songs"),
-    BotCommand("loop", "Toggle repeat"),
-    BotCommand("stop", "Stop playback and clear the queue"),
-]
 
 
 @dataclass
@@ -560,11 +547,6 @@ async def watchdog():
 
 async def main():
     await bot.start()
-    if not await bot.set_bot_commands(
-        BOT_COMMANDS,
-        scope=BotCommandScopeAllGroupChats(),
-    ):
-        raise RuntimeError("Telegram did not accept the bot command list")
     await assistant.start()
     await calls.start()
     try:
