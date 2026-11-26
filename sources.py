@@ -8,7 +8,7 @@ Env options (all optional):
   SOURCE_ORDER      e.g. "youtube,audius,soundcloud"   (order / subset of sources)
   SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET  optional Spotify catalog lookup credentials
   JAMENDO_CLIENT_ID free Jamendo key (enables the "jamendo" source)
-  COOKIES_TXT / COOKIES_BASE64   optional YouTube cookies (default: cookies.txt next to this file)
+  COOKIES_TXT / COOKIES_BASE64   optional YouTube cookies (default: cookies.txt next to this file)\n  COOKIES_FROM_BROWSER           auto-detect an existing logged-in browser profile, or set chrome[:profile],firefox,etc.
   ENABLE_YOUTUBE                  set to 0 to disable YouTube (enabled by default)
   RESOLVE_TIMEOUT   max seconds spent on one search (default 55)
 """
@@ -192,7 +192,36 @@ def _prepare_cookies() -> str | None:
 COOKIES = _prepare_cookies()
 
 
-def _ydl_opts(cookies: bool = True, clients: list[str] | None = None) -> dict:
+def _browser_cookie_specs() -> list[tuple[str, str | None, None, None]]:
+    """Find existing logged-in browser profiles; this reads sessions, it cannot create logins."""
+    setting = os.environ.get("COOKIES_FROM_BROWSER", "auto").strip()
+    known = {
+        "chrome": os.path.expanduser("~/.config/google-chrome"),
+        "chromium": os.path.expanduser("~/.config/chromium"),
+        "firefox": os.path.expanduser("~/.mozilla/firefox"),
+        "edge": os.path.expanduser("~/.config/microsoft-edge"),
+        "brave": os.path.expanduser("~/.config/BraveSoftware/Brave-Browser"),
+        "opera": os.path.expanduser("~/.config/opera"),
+        "vivaldi": os.path.expanduser("~/.config/vivaldi"),
+    }
+    specs = []
+    if not setting or setting.lower() in {"0", "false", "off", "none"}:
+        return specs
+    entries = list(known) if setting.lower() == "auto" else [x.strip() for x in setting.split(",") if x.strip()]
+    for entry in entries:
+        browser, sep, profile = entry.partition(":")
+        browser = browser.lower()
+        if browser not in known:
+            log("ignoring unsupported COOKIES_FROM_BROWSER entry:", browser)
+            continue
+        if setting.lower() == "auto" and not os.path.isdir(known[browser]):
+            continue
+        specs.append((browser, profile or None, None, None))
+    return specs
+
+
+def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
+              browser: tuple[str, str | None, None, None] | None = None) -> dict:
     o = {
         "format": "bestaudio[acodec!=none]/best[acodec!=none]/best",
         "js_runtimes": {"deno": {}, "node": {}},
@@ -207,6 +236,8 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None) -> dict:
     }
     if cookies and COOKIES:
         o["cookiefile"] = COOKIES
+    elif browser:
+        o["cookiesfrombrowser"] = browser
     if clients:
         o["extractor_args"] = {"youtube": {"player_client": clients}}
     return o
@@ -256,9 +287,21 @@ def _youtube(target: str) -> dict:
     m = re.match(r"ytsearch\d*:(.*)", target, re.I)
     if m:
         search_query = m.group(1).strip()
-    for a in YT_ATTEMPTS:
+    attempts = list(YT_ATTEMPTS)
+    # If ordinary extraction is challenged, try importing an already-authenticated
+    # browser profile. This cannot create a Google login or bypass verification.
+    for browser_spec in _browser_cookie_specs():
+        attempts.append({"browser": browser_spec, "cookies": False})
+    if not COOKIES:
+        specs = _browser_cookie_specs()
+        if not specs:
+            log("no YouTube cookie file or logged-in browser profile found; "
+                "set COOKIES_BASE64/COOKIES_TXT or provide an authenticated browser profile")
+    for a in attempts:
         try:
-            entries = _ydl_entries(_ydl_opts(a.get("cookies", True), a.get("clients")), target)
+            entries = _ydl_entries(
+                _ydl_opts(a.get("cookies", True), a.get("clients"), a.get("browser")), target
+            )
             if search_query:
                 entries = sorted(
                     entries,
