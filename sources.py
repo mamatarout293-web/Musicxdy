@@ -102,8 +102,8 @@ def _finish(info: dict) -> dict:
     # allowed because some providers do not publish bitrate/sample-rate fields.
     try:
         abr = float(info.get("abr") or 0)
-        if abr and abr < 96:
-            raise RuntimeError(f"{info.get('source')}: audio bitrate too low ({abr:.0f} kbps)")
+        if abr and abr < 128:
+            raise RuntimeError(f"{info.get('source')}: audio bitrate below 128 kbps ({abr:.0f} kbps)")
         asr = int(info.get("asr") or 0)
         if asr and asr < 32000:
             raise RuntimeError(f"{info.get('source')}: sample rate too low ({asr} Hz)")
@@ -125,12 +125,12 @@ def _tokens(s: str) -> set[str]:
 
 
 def _relevant(query: str, title: str, artist: str = "") -> bool:
-    """Reject weak matches; artist/title tokens must substantially match the request."""
+    """Fail closed on weak matches: title + artist must identify the requested recording."""
     q = _tokens(query)
     if not q:
-        return True
+        return False
     have = _tokens(f"{title} {artist}")
-    return len(q & have) / len(q) >= 0.6
+    return len(q & have) / len(q) >= 0.75
 
 
 _VARIANT = re.compile(
@@ -142,11 +142,11 @@ _VARIANT = re.compile(
 )
 
 
-def _variant_unwanted(query: str, title: str) -> bool:
-    """Avoid mixes/covers when the user asked for the original recording."""
+def _variant_unwanted(query: str, title: str, artist: str = "") -> bool:
+    """Reject alternate edits named in either the title or the publishing channel."""
     if _VARIANT.search(query):
         return False
-    return bool(_VARIANT.search(title))
+    return bool(_VARIANT.search(f"{title} {artist}"))
 
 
 def _match_score(query: str, title: str, artist: str = "") -> float:
@@ -229,7 +229,7 @@ def _norm(info: dict, source: str) -> dict:
         "url": info.get("url"),
         "page": info.get("webpage_url") or info.get("original_url") or "",
         "duration": int(info.get("duration") or 0),
-        "artist": info.get("artist") or info.get("uploader") or info.get("channel") or "",
+        "artist": info.get("artist") or info.get("creator") or info.get("uploader") or info.get("channel") or "",
         "headers": info.get("http_headers") or {},
         "abr": info.get("abr"),
         "asr": info.get("asr"),
@@ -272,7 +272,8 @@ def _youtube(target: str) -> dict:
                 info = _norm(entry, "youtube")
                 if search_query and (
                     not _relevant(search_query, info["title"], info["artist"])
-                    or _variant_unwanted(search_query, info["title"])
+                    or _variant_unwanted(search_query, info["title"], info["artist"])
+                    or _match_score(search_query, info["title"], info["artist"]) < 5.0
                 ):
                     continue
                 try:
@@ -300,7 +301,7 @@ def _soundcloud(q: str) -> dict:
         if "preview" in f"{e.get('format_note', '')} {e.get('format_id', '')}".lower():
             continue
         info = _norm(e, "soundcloud")
-        if not _relevant(q, info["title"], info["artist"]) or _variant_unwanted(q, info["title"]):
+        if not _relevant(q, info["title"], info["artist"]) or _variant_unwanted(q, info["title"], info["artist"]):
             continue
         try:
             return _finish(info)
@@ -351,7 +352,7 @@ def _audius(q: str) -> dict:
                 artist = (t.get("user") or {}).get("name", "")
                 if (not track_id or track_key in seen or t.get("is_streamable") is False
                         or not _relevant(q, t.get("title", ""), artist)
-                        or _variant_unwanted(q, t.get("title", ""))):
+                        or _variant_unwanted(q, t.get("title", ""), artist)): 
                     continue
                 seen.add(track_key)
                 try:
@@ -427,7 +428,7 @@ def _spotify_catalog_query(q: str) -> str:
             name = track.get("name") or ""
             artists = ", ".join(a.get("name", "") for a in track.get("artists", []) if a.get("name"))
             if (not name or not _relevant(q, name, artists)
-                    or _variant_unwanted(q, name)):
+                    or _variant_unwanted(q, name, artists)):
                 continue
             candidates.append((_match_score(q, name, artists), name, artists))
         if not candidates:
@@ -468,9 +469,12 @@ def _build() -> list[Source]:
     youtube_enabled = os.environ.get("ENABLE_YOUTUBE", "1").strip().lower() in {"1", "true", "yes", "on"}
     if youtube_enabled:
         s.append(Source("youtube", lambda q: _youtube(f"ytsearch10:{q}")))
-    s.extend([Source("audius", _audius), Source("soundcloud", _soundcloud)])
-    if os.environ.get("JAMENDO_CLIENT_ID"):
-        s.append(Source("jamendo", _jamendo))
+    # Alternate user uploads are disabled by default: they often return covers,
+    # edits, or low-quality copies. Enable only as an explicit last-resort choice.
+    if os.environ.get("ENABLE_ALTERNATE_SOURCES", "").strip().lower() in {"1", "true", "yes", "on"}:
+        s.extend([Source("audius", _audius), Source("soundcloud", _soundcloud)])
+        if os.environ.get("JAMENDO_CLIENT_ID"):
+            s.append(Source("jamendo", _jamendo))
     if not s:
         raise RuntimeError("No music sources enabled")
     order = [x.strip() for x in os.environ.get("SOURCE_ORDER", "").split(",") if x.strip()]
