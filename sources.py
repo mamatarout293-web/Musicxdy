@@ -165,6 +165,28 @@ def _match_score(query: str, title: str, artist: str = "") -> float:
     return score
 
 
+def _validate_cookie_domains(data: str) -> None:
+    """Reject cookie exports containing credentials for unrelated services."""
+    allowed = {
+        "google.com", "www.google.com", "accounts.google.com", "ogs.google.com",
+        "youtube.com", "www.youtube.com", "m.youtube.com",
+    }
+    found = 0
+    for line_no, raw in enumerate(data.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#") and not line.startswith("#HttpOnly_"):
+            continue
+        fields = line.split("\\t")
+        if len(fields) != 7:
+            raise ValueError(f"invalid Netscape cookie row at line {line_no}")
+        domain = fields[0].removeprefix("#HttpOnly_").lstrip(".").lower()
+        if domain not in allowed:
+            raise ValueError(f"cookie export contains an unrelated domain at line {line_no}")
+        found += 1
+    if not found:
+        raise ValueError("cookie export contains no supported Google/YouTube cookies")
+
+
 def _prepare_cookies() -> str | None:
     """yt-dlp rewrites its cookie file, so work on a writable copy."""
     dst = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
@@ -179,8 +201,9 @@ def _prepare_cookies() -> str | None:
             src = os.path.join(ROOT, "cookies.txt")
             if not os.path.exists(src):
                 return None
-            shutil.copyfile(src, dst)
-            return dst
+            with open(src, "r", encoding="utf-8") as f:
+                data = f.read()
+        _validate_cookie_domains(data)
         with open(dst, "w", encoding="utf-8") as f:
             f.write(data)
         return dst
