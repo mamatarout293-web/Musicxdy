@@ -113,7 +113,9 @@ def _relevant(query: str, title: str, artist: str = "") -> bool:
 
 
 _VARIANT = re.compile(
-    r"\b(?:mix(?:es)?|remix(?:es)?|mashup|medley|sped\s*up|slowed(?:\s*\+\s*reverb)?|"
+    r"\b(?:mix(?:es)?|remix(?:es)?|mashup|medley|tiktok|reprised?|"
+    r"female\s+version|male\s+version|acoustic(?:\s+version)?|piano\s+version|"
+    r"lo[ -]?fi|fan[ -]?made|bootleg|rework|flip|sped\s*up|slowed(?:\s*\+\s*reverb)?|"
     r"nightcore|8d|karaoke|cover|live|instrumental|bass\s*boosted|extended|dj\s*set|"
     r"lyrics?\s*video)\b", re.I
 )
@@ -224,11 +226,37 @@ YT_ATTEMPTS = [
 
 def _youtube(target: str) -> dict:
     last: Exception | None = None
+    # Search results must pass the same title/variant checks as other sources.
+    # Direct user-provided YouTube links are intentionally resolved as requested.
+    search_query = None
+    m = re.match(r"ytsearch\\d*:(.*)", target, re.I)
+    if m:
+        search_query = m.group(1).strip()
     for a in YT_ATTEMPTS:
         try:
             entries = _ydl_entries(_ydl_opts(a.get("cookies", True), a.get("clients")), target)
-            info = _norm(entries[0], "youtube")
-            return _finish(info)  # unreachable URL -> try the next YouTube client
+            if search_query:
+                entries = sorted(
+                    entries,
+                    key=lambda e: _match_score(
+                        search_query, e.get("title", ""),
+                        e.get("artist") or e.get("uploader") or e.get("channel", "")
+                    ),
+                    reverse=True,
+                )
+            for entry in entries:
+                info = _norm(entry, "youtube")
+                if search_query and (
+                    not _relevant(search_query, info["title"], info["artist"])
+                    or _variant_unwanted(search_query, info["title"])
+                ):
+                    continue
+                try:
+                    return _finish(info)
+                except Exception as e:
+                    last = e
+            if search_query:
+                raise NotFound("youtube: no acceptable search result")
         except NotFound:
             raise
         except Exception as e:
