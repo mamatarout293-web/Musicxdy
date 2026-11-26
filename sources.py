@@ -11,6 +11,8 @@ Env options (all optional):
   JAMENDO_CLIENT_ID free Jamendo key (enables the "jamendo" source)
   PIPED_APIS        comma separated Piped API URLs (default: auto-discovered)
   COOKIES_TXT / COOKIES_BASE64   YouTube cookies (default: cookies.txt next to this file)
+  YTDLP_PROXY       proxy URL (e.g. http://user:pass@host:port) used for YouTube only. YouTube blocks
+                    datacenter IPs; with a proxy the audio is downloaded through it and played from disk.
   RESOLVE_TIMEOUT   max seconds spent on one search (default 55)
 """
 from __future__ import annotations
@@ -129,6 +131,23 @@ def _prepare_cookies() -> str | None:
 
 
 COOKIES = _prepare_cookies()
+YT_PROXY = os.environ.get("YTDLP_PROXY", "").strip() or None
+
+
+def _cookies_status() -> None:
+    if not COOKIES:
+        log("cookies: none loaded")
+        return
+    try:
+        with open(COOKIES, encoding="utf-8", errors="replace") as f:
+            n = sum(1 for l in f if l.strip() and not l.startswith("#") and l.count("\t") >= 6)
+        log(f"cookies: {n} entries loaded" + ("" if n else " (NOT valid Netscape format - re-export)"))
+    except Exception as e:
+        log("cookies check failed:", e)
+
+
+_cookies_status()
+log("youtube proxy:", "on" if YT_PROXY else "off")
 
 
 def _ydl_opts(cookies: bool = True, clients: list[str] | None = None) -> dict:
@@ -146,6 +165,8 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None) -> dict:
     }
     if cookies and COOKIES:
         o["cookiefile"] = COOKIES
+    if YT_PROXY:
+        o["proxy"] = YT_PROXY
     if clients:
         o["extractor_args"] = {"youtube": {"player_client": clients}}
     return o
@@ -181,14 +202,35 @@ YT_ATTEMPTS = [
     {"clients": ["tv", "web_safari"]},                  # with cookies
     {"clients": ["android_vr"], "cookies": False},      # no cookies, no JS needed
     {"clients": ["mweb"], "cookies": False},
+    {"clients": ["web_embedded", "ios"], "cookies": False},
 ]
+
+
+def _download_audio(target: str, opts: dict) -> dict:
+    """Download through the proxy; googlevideo URLs are tied to the proxy's IP so they can't be streamed directly."""
+    d = os.path.join(tempfile.gettempdir(), "ytcache")
+    os.makedirs(d, exist_ok=True)
+    opts = dict(opts, skip_download=False, outtmpl=os.path.join(d, "%(id)s.%(ext)s"))
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(target, download=True)
+        if info and info.get("entries"):
+            info = next(e for e in info["entries"] if e)
+        path = ydl.prepare_filename(info)
+    if not os.path.exists(path):
+        raise RuntimeError("youtube: download failed")
+    out = _norm(info, "youtube")
+    out["url"], out["headers"] = path, {}
+    return out
 
 
 def _youtube(target: str) -> dict:
     last: Exception | None = None
     for a in YT_ATTEMPTS:
         try:
-            entries = _ydl_entries(_ydl_opts(a.get("cookies", True), a.get("clients")), target)
+            opts = _ydl_opts(a.get("cookies", True), a.get("clients"))
+            if YT_PROXY:
+                return _download_audio(target, opts)
+            entries = _ydl_entries(opts, target)
             info = _norm(entries[0], "youtube")
             return _finish(info)  # unreachable URL -> try the next YouTube client
         except NotFound:
