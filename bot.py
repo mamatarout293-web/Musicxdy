@@ -25,6 +25,7 @@ if _missing:
     sys.exit(2)
 
 from pyrogram import Client, filters, idle
+from pyrogram.errors import FloodWait
 from pyrogram.raw import functions
 from pyrogram.raw.types import InputStickerSetShortName
 from pyrogram.types import (
@@ -568,7 +569,21 @@ async def main():
         scope=BotCommandScopeAllGroupChats(),
     ):
         raise RuntimeError("Telegram did not accept the bot command list")
-    await assistant.start()
+    # Telegram may temporarily rate-limit assistant-session authorization.
+    # Keep the bot client online (and its commands registered) while respecting
+    # Telegram's exact FloodWait duration instead of crashing into Railway restarts.
+    while True:
+        try:
+            await assistant.start()
+            break
+        except FloodWait as e:
+            wait_seconds = max(int(getattr(e, "value", 0)), 1) + 5
+            print(
+                f"Telegram FloodWait during assistant authorization; "
+                f"waiting {wait_seconds}s before retrying.",
+                flush=True,
+            )
+            await asyncio.sleep(wait_seconds)
     await calls.start()
     try:
         await load_emojis()
