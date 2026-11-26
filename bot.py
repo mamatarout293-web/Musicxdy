@@ -6,6 +6,7 @@ LOOP = asyncio.new_event_loop()
 asyncio.set_event_loop(LOOP)
 
 import html
+import logging
 import json
 import os
 import random
@@ -36,6 +37,9 @@ from pyrogram.types import (
 )
 from pytgcalls import PyTgCalls, filters as call_filters
 from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
+
+# Ask PyTgCalls to expose FFmpeg input/decoding diagnostics in Railway logs.
+logging.getLogger('ffmpeg').setLevel(logging.DEBUG)
 
 import sources
 
