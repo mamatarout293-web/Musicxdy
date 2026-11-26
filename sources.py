@@ -7,7 +7,7 @@ anything might still work.
 
 Env options (all optional):
   SOURCE_ORDER      e.g. "soundcloud,audius,youtube"   (order / subset of sources)
-  SAAVN_API         base URL of a JioSaavn-compatible API (enables the "saavn" source)
+  SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET  optional Spotify catalog lookup credentials
   JAMENDO_CLIENT_ID free Jamendo key (enables the "jamendo" source)
   COOKIES_TXT / COOKIES_BASE64   YouTube cookies (default: cookies.txt next to this file)
   RESOLVE_TIMEOUT   max seconds spent on one search (default 55)
@@ -355,44 +355,65 @@ def _jamendo(q: str) -> dict:
     raise NotFound("jamendo: no relevant result")
 
 
-def _saavn(q: str) -> dict:
-    # Public JioSaavn-compatible API; SAAVN_API can override the host if needed.
-    base = os.environ.get("SAAVN_API", "https://jio.shnwaz.dev").rstrip("/")
-    d = get_json(
-        f"{base}/api/search/songs?query={urllib.parse.quote(q)}&limit=10"
-    )
-    results = (d.get("data") or {}).get("results") or []
-    candidates = []
-    for r in results:
-        name = r.get("name") or r.get("title") or ""
-        primary = ((r.get("artists") or {}).get("primary") or [])
-        names = ", ".join(a.get("name", "") for a in primary if a.get("name"))
-        if not name or not _relevant(q, name, names) or _variant_unwanted(q, name):
-            continue
-        downloads = [x for x in (r.get("downloadUrl") or []) if x.get("url")]
-        if not downloads:
-            continue
-        # Prefer the highest declared quality, not merely the last array entry.
-        def quality(item):
-            match = re.search(r"(\d+)", str(item.get("quality") or ""))
-            return int(match.group(1)) if match else 0
-        best = max(downloads, key=quality)
-        candidates.append(( _match_score(q, name, names), r, names, best ))
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    for _, r, names, best in candidates:
-        try:
-            return _finish({
-                "title": r.get("name") or r.get("title") or "Unknown",
-                "url": best["url"],
-                "page": r.get("url") or "",
-                "duration": int(r.get("duration") or 0),
-                "artist": names,
-                "headers": {},
-                "source": "saavn",
-            })
-        except Exception as e:
-            log("saavn candidate failed:", str(e)[:120])
-    raise NotFound("saavn: no relevant playable result")
+# ───────────────────────── Spotify catalogue lookup ─────────────────────────
+_spotify_token_cache = {"token": "", "expires": 0.0}
+
+
+def _spotify_catalog_query(q: str) -> str:
+    """Use Spotify Web API for canonical title/artist matching only, never for audio streams."""
+    client_id = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        return q
+
+    try:
+        cached = _spotify_token_cache
+        if cached["token"] and time.time() < cached["expires"] - 30:
+            token = cached["token"]
+        else:
+            credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+            request = urllib.request.Request(
+                "https://accounts.spotify.com/api/token",
+                data=urllib.parse.urlencode({"grant_type": "client_credentials"}).encode(),
+                headers={
+                    "Authorization": f"Basic {credentials}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": UA,
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+                auth = json.loads(response.read(100_000).decode("utf-8", "replace"))
+            token = auth["access_token"]
+            _spotify_token_cache.update(token=token, expires=time.time() + int(auth.get("expires_in", 3600)))
+
+        params = urllib.parse.urlencode({"q": q, "type": "track", "market": "IN", "limit": 10})
+        request = urllib.request.Request(
+            f"https://api.spotify.com/v1/search?{params}",
+            headers={"Authorization": f"Bearer {token}", "User-Agent": UA},
+        )
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            data = json.loads(response.read(1_000_000).decode("utf-8", "replace"))
+
+        tracks = (data.get("tracks") or {}).get("items") or []
+        candidates = []
+        for track in tracks:
+            name = track.get("name") or ""
+            artists = ", ".join(a.get("name", "") for a in track.get("artists", []) if a.get("name"))
+            if (not name or not _relevant(q, name, artists)
+                    or _variant_unwanted(q, name)):
+                continue
+            candidates.append((_match_score(q, name, artists), name, artists))
+        if not candidates:
+            return q
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        _, name, artists = candidates[0]
+        canonical = f"{name} {artists}".strip()
+        log(f"Spotify catalogue match: {canonical}")
+        return canonical
+    except Exception as e:
+        log("Spotify catalogue lookup unavailable; using original query:", str(e)[:140])
+        return q
 
 
 # ───────────────────────── registry ─────────────────────────
@@ -417,8 +438,7 @@ class Source:
 def _build() -> list[Source]:
     # YouTube is deliberately disabled by default. Enable only with ENABLE_YOUTUBE=1.
     s = []
-    # JioSaavn is the primary source. The public API needs no user credentials.
-    s.append(Source("saavn", _saavn))
+    # Spotify is used only to identify the canonical track; it does not provide full-track streams.
     s.extend([Source("audius", _audius), Source("soundcloud", _soundcloud)])
     if os.environ.get("JAMENDO_CLIENT_ID"):
         s.append(Source("jamendo", _jamendo))
@@ -499,6 +519,8 @@ def resolve(query: str, skip=()) -> dict:
             raise Unavailable(errors or ["could not read that link"])
         log("link failed/unsupported, searching other sources for:", hint)
         query = hint
+
+    query = _spotify_catalog_query(query)
 
     ordered = [s for s in SOURCES if s.name not in skip]
     ordered.sort(key=lambda s: not s.alive)  # healthy sources first, cooling-down ones as last resort
