@@ -306,7 +306,11 @@ async def start_with_fallback(chat_id: int, t: Track):
     last_error: Exception | None = None
     for attempt in range(attempts):
         try:
-            await ensure_fresh(t)
+            # A caller may have marked the just-ended provider bad before entering here.
+            if t.source and t.source in t.bad:
+                await reresolve(t)
+            else:
+                await ensure_fresh(t)
             await start_stream(chat_id, t)
             return
         except Exception as e:
