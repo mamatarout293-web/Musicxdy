@@ -371,7 +371,7 @@ async def start_stream(chat_id: int, t: Track, seek_to: int | None = None):
     t.end_state = ""
     t.final_elapsed = 0
     # Suppress the previous stream's end event while this start/replacement is in flight.
-    t.ignore_end_until = time.time() + 3.0
+    t.ignore_end_until = time.time() + 8.0
     t.start_token += 1
     token = t.start_token
     try:
@@ -395,7 +395,7 @@ async def start_stream(chat_id: int, t: Track, seek_to: int | None = None):
             except Exception:
                 pass
             await asyncio.sleep(0.5)
-            t.ignore_end_until = time.time() + 3.0
+            t.ignore_end_until = time.time() + 8.0
             try:
                 await calls.play(chat_id, stream)
             except Exception as retry_error:
@@ -407,7 +407,7 @@ async def start_stream(chat_id: int, t: Track, seek_to: int | None = None):
     t.paused_at = 0.0
     # Replacing a stream makes the old stream emit StreamEnded. Ignore that stale
     # event briefly, otherwise it advances the brand-new track and cuts the sound.
-    t.ignore_end_until = time.time() + 3.0
+    t.ignore_end_until = time.time() + 8.0
     spawn(watch_start(chat_id, t, token))
 
 
@@ -428,23 +428,43 @@ def _is_call_setup_error(error: Exception) -> bool:
     )
 
 
+async def _playback_state(chat_id: int):
+    try:
+        states = await asyncio.wait_for(calls.calls, timeout=3)
+    except Exception:
+        return None
+    return states.get(chat_id) if hasattr(states, "get") else None
+
+
 async def watch_start(chat_id: int, t: Track, token: int):
-    """Catch a silent start: if the call is idle after a few seconds, retry once."""
-    await asyncio.sleep(3.0)
+    """Catch a genuinely silent start without killing a stream that is still connecting."""
+    await asyncio.sleep(8.0)
     lock = advance_locks.setdefault(chat_id, asyncio.Lock())
     retry = False
     async with lock:
         if t.start_token != token:
             return
         q = queues.get(chat_id)
-        if not q or q[0] is not t or t.end_seen:
+        if not q or q[0] is not t or t.end_seen or t.end_state or t.paused_at:
             return
-        try:
-            states = await asyncio.wait_for(calls.calls, timeout=3)
-            state = states.get(chat_id) if hasattr(states, "get") else None
-        except Exception:
+        state = await _playback_state(chat_id)
+        if state is None:
+            # PyTgCalls may not have registered the call yet. Treat this as unknown,
+            # not as silence; retrying here used to replace a healthy starting stream.
+            print("call state not registered yet; not retrying", flush=True)
             return
-        if state is not None and state.playback != Call.Status.IDLE:
+        if state.playback != Call.Status.IDLE:
+            return
+        # Confirm IDLE once more before replacing the stream. A single early read
+        # can happen while ffmpeg is still opening the source.
+        await asyncio.sleep(2.0)
+        if t.start_token != token:
+            return
+        q = queues.get(chat_id)
+        if not q or q[0] is not t or t.end_seen or t.end_state or t.paused_at:
+            return
+        state = await _playback_state(chat_id)
+        if state is None or state.playback != Call.Status.IDLE:
             return
         print("no active playback after start; retrying:", t.title, flush=True)
         if t.retries >= 3:
@@ -619,7 +639,7 @@ async def play_next(chat_id: int, force: bool = False, expected: Track | None = 
                 if q:
                     # Protect the next track from the old stream's end event while it starts.
                     q[0].end_seen = False
-                    q[0].ignore_end_until = time.time() + 3.0
+                    q[0].ignore_end_until = time.time() + 8.0
                 if done.started:
                     history.setdefault(chat_id, []).append(done)
                     del history[chat_id][:-20]
@@ -729,7 +749,7 @@ async def act(chat_id: int, action: str) -> str:
             prev.end_state = ""
             prev.final_elapsed = 0
             prev.end_seen = False
-            prev.ignore_end_until = time.time() + 3.0
+            prev.ignore_end_until = time.time() + 8.0
             prev.retries = 0
             prev.bad.clear()
             await asyncio.sleep(0.15)
@@ -863,7 +883,7 @@ async def play_query(m: Message, force: bool = False):
         q = queues.setdefault(m.chat.id, [])
         q.append(t)
         t.end_seen = False
-        t.ignore_end_until = time.time() + 3.0
+        t.ignore_end_until = time.time() + 8.0
         # Let the replaced stream stop before asking PyTgCalls to play the new one.
         await asyncio.sleep(0.2)
     else:
