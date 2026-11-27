@@ -14,6 +14,7 @@ RUN apt-get update \
 RUN curl -fsSL https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/latest/download/bgutil-pot-linux-x86_64 \
         -o /usr/local/bin/bgutil-pot \
  && chmod +x /usr/local/bin/bgutil-pot \
+ && /usr/local/bin/bgutil-pot --version \
  && curl -fsSL https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/latest/download/bgutil-ytdlp-pot-provider-rs.zip \
         -o /tmp/bgutil-ytdlp-pot-provider-rs.zip \
  && python -c "import site, zipfile; zipfile.ZipFile('/tmp/bgutil-ytdlp-pot-provider-rs.zip').extractall(site.getsitepackages()[0])" \

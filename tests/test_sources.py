@@ -82,6 +82,40 @@ class SourceOrderTests(unittest.TestCase):
         self.assertEqual(names, ["youtube"])
 
 
+class YoutubePotTests(unittest.TestCase):
+    def test_ydl_opts_points_to_rust_cli_provider(self):
+        opts = sources._ydl_opts(clients=["tv"])
+
+        self.assertEqual(
+            opts["extractor_args"]["youtubepot-bgutilcli"]["cli_path"],
+            ["/usr/local/bin/bgutil-pot"],
+        )
+        self.assertEqual(opts["extractor_args"]["youtube"]["player_client"], ["tv"])
+
+    def test_cookie_bot_check_retries_same_client_without_cookiefile(self):
+        def extract(opts, _target):
+            if "cookiefile" in opts:
+                raise RuntimeError("Sign in to confirm you're not a bot")
+            return [{"title": "Song"}]
+
+        with patch.object(sources, "COOKIES", "/tmp/cookies.txt"), \
+                patch.object(sources, "_yt_attempts", return_value=[
+                    {"cookies": True, "clients": ["tv"]}
+                ]), \
+                patch.object(sources, "_ydl_entries", side_effect=extract) as ydl_entries, \
+                patch.object(sources, "_finish", return_value={"source": "youtube"}) as finish:
+            result = sources._yt_extract("https://youtube.com/watch?v=example")
+
+        self.assertEqual(result, {"source": "youtube"})
+        first_opts = ydl_entries.call_args_list[0].args[0]
+        retry_opts = ydl_entries.call_args_list[1].args[0]
+        self.assertEqual(first_opts["cookiefile"], "/tmp/cookies.txt")
+        self.assertNotIn("cookiefile", retry_opts)
+        self.assertEqual(retry_opts["extractor_args"]["youtube"]["player_client"], ["tv"])
+        self.assertEqual(ydl_entries.call_count, 2)
+        finish.assert_called_once()
+
+
 class StreamHeaderTests(unittest.TestCase):
     @patch("sources.playable", return_value=True)
     def test_finish_preserves_individual_ffmpeg_headers(self, playable):

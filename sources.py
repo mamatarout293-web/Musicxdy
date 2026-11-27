@@ -273,6 +273,9 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
         "socket_timeout": 10,
         "retries": 1,
         "extractor_retries": 1,
+        "extractor_args": {
+            "youtubepot-bgutilcli": {"cli_path": ["/usr/local/bin/bgutil-pot"]},
+        },
     }
     if cookies and COOKIES:
         o["cookiefile"] = COOKIES
@@ -281,7 +284,7 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
     if proxy:
         o["proxy"] = proxy
     if clients:
-        o["extractor_args"] = {"youtube": {"player_client": clients}}
+        o["extractor_args"]["youtube"] = {"player_client": clients}
     return o
 
 
@@ -353,6 +356,15 @@ def _yt_extract(url: str) -> dict:
         except Exception as e:
             last = e
             log("youtube attempt failed:", str(e)[:160])
+            if _is_bot_check(e) and a.get("cookies", True) and COOKIES:
+                try:
+                    entries = _ydl_entries(
+                        _ydl_opts(cookies=False, clients=a.get("clients"), proxy=YT_PROXY), url
+                    )
+                    return _finish(_norm(entries[0], "youtube"))
+                except Exception as retry_error:
+                    last = retry_error
+                    log("youtube retry without cookies failed:", str(retry_error)[:160])
     raise last or RuntimeError("youtube failed")
 
 
