@@ -19,7 +19,6 @@ COOKIES_REFRESH=21600 (optional; seconds between COOKIES_URL refreshes)
 COOKIES_FROM_BROWSER=auto (optional; imports an existing browser profile when available)
 ENABLE_ALTERNATE_SOURCES=1 (optional; allows Audius/SoundCloud fallback)
 MIN_AUDIO_KBPS=120 (optional; reject lower-bitrate formats)
-VERIFY_YOUTUBE=0 (optional; keep 0, YouTube URLs are IP-bound)
 AUDIO_QUALITY=high (optional; high = 48 kHz stereo, medium = 36 kHz mono fallback)
 AUDIO_NORMALIZE=1 (optional; EBU R128 loudness normalization, 0 to disable)
 ```
@@ -73,9 +72,8 @@ Audio quality and start speed:
 - `MIN_AUDIO_KBPS` (default 120) rejects clearly low-bitrate streams before they are played.
 - The last client strategy that produced a good stream is remembered and tried first, so the next
   song starts faster; repeated queries are cached for 30 minutes.
-- `VERIFY_YOUTUBE=0` (default) skips the extra stream probe. YouTube URLs are bound to the IP that
-  resolved them, so probing them separately can fail and force a slow, low-quality fallback. Set
-  `VERIFY_YOUTUBE=1` only if you need dead-link detection before playback.
+- YouTube stream URLs are always probed before playback. A URL that resolves but returns 403 to
+  ffmpeg is rejected and the next source is tried, instead of starting a dead stream.
 - The log line `youtube pick:` shows which title/channel/view count was selected and whether it
   was official.
 

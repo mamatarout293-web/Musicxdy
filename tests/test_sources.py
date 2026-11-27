@@ -336,23 +336,17 @@ class QualityGateTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             sources._finish(info)
 
-    def test_allows_muxed_format_as_last_resort(self):
+    @patch("sources.playable", return_value=True)
+    def test_allows_muxed_format_as_last_resort(self, _playable):
         info = {"url": "https://example/stream", "source": "youtube",
                 "vcodec": "avc1.42001E", "abr": None, "asr": None}
         self.assertEqual(sources._finish(info, allow_low_quality=True), info)
 
-    @patch("sources.playable", side_effect=AssertionError("must not probe YouTube"))
-    def test_youtube_stream_is_not_probed_by_default(self, _playable):
+    @patch("sources.playable", return_value=True)
+    def test_youtube_stream_is_always_probed(self, playable):
         info = {"url": "https://example/stream", "source": "youtube",
                 "vcodec": "none", "abr": 138.8, "asr": 48000}
         self.assertEqual(sources._finish(info), info)
-
-    @patch("sources.playable", return_value=True)
-    def test_youtube_stream_is_probed_when_enabled(self, playable):
-        info = {"url": "https://example/stream", "source": "youtube",
-                "vcodec": "none", "abr": 138.8, "asr": 48000}
-        with patch.object(sources, "VERIFY_YOUTUBE", True):
-            self.assertEqual(sources._finish(info), info)
         playable.assert_called_once()
 
     def test_last_good_attempt_moves_to_front(self):

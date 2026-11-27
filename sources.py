@@ -48,10 +48,9 @@ URL_RE = re.compile(r"^https?://", re.I)
 # Optional HTTP proxy (ideally residential) used ONLY for YouTube. YouTube stream
 # links are locked to the IP that resolved them, so playback must use it too.
 YT_PROXY = os.environ.get("YT_PROXY", "").strip() or None
-# Verifying a YouTube stream URL costs an extra round-trip and can fail when the
-# signed URL is bound to the proxy/IP that resolved it. Playback fails fast on a
-# dead link, so verification is opt-in for YouTube (VERIFY_YOUTUBE=1).
-VERIFY_YOUTUBE = os.environ.get("VERIFY_YOUTUBE", "0").strip().lower() in {"1", "true", "yes", "on"}
+# A YouTube URL can resolve successfully and still answer 403 to ffmpeg (IP-bound
+# or PO-token protected). Probe every stream before playback; otherwise the bot
+# only discovers the dead link after the stream has already started and stopped.
 try:
     MIN_AUDIO_KBPS = float(os.environ.get("MIN_AUDIO_KBPS", "120") or 120)
 except ValueError:
@@ -162,7 +161,7 @@ def _finish(info: dict, allow_low_quality: bool = False) -> dict:
         # usually YouTube's low-quality 360p format 18.
         if muxed and not abr:
             raise RuntimeError(f"{source}: only a muxed video format is available")
-    verify = source != "youtube" or VERIFY_YOUTUBE
+    verify = True
     if verify and not playable(info["url"], info.get("headers") or {},
                                YT_PROXY if source == "youtube" else None):
         raise RuntimeError(f"{source}: stream not reachable")
