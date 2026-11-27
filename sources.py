@@ -274,6 +274,7 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
         "retries": 1,
         "extractor_retries": 1,
         "extractor_args": {
+            "youtube": {"player_client": ["tv", "web_embedded", "default"]},
             "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
         },
     }

@@ -83,6 +83,18 @@ class SourceOrderTests(unittest.TestCase):
 
 
 class YoutubePotTests(unittest.TestCase):
+    def test_ydl_opts_uses_reload_workaround_clients_by_default(self):
+        opts = sources._ydl_opts()
+
+        self.assertEqual(
+            opts["extractor_args"]["youtube"]["player_client"],
+            ["tv", "web_embedded", "default"],
+        )
+        self.assertEqual(
+            opts["extractor_args"]["youtubepot-bgutilhttp"]["base_url"],
+            ["http://127.0.0.1:4416"],
+        )
+
     def test_ydl_opts_points_to_rust_http_provider(self):
         opts = sources._ydl_opts(clients=["tv"])
 
