@@ -256,7 +256,6 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
     o = {
         "format": "bestaudio[acodec!=none]/best[acodec!=none]/best",
         "js_runtimes": {"deno": {}, "node": {}},
-        "remote_components": ["ejs:github"],
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -310,60 +309,90 @@ YT_ATTEMPTS = [
 ]
 
 
-def _youtube(target: str) -> dict:
-    last: Exception | None = None
-    # Search results must pass the same title/variant checks as other sources.
-    # Direct user-provided YouTube links are intentionally resolved as requested.
-    search_query = None
-    m = re.match(r"ytsearch\d*:(.*)", target, re.I)
-    if m:
-        search_query = m.group(1).strip()
+_YT_CACHE: dict[str, tuple[float, dict]] = {}
+_YT_CACHE_TTL = 1800  # stream URLs stay valid for hours; 30 min keeps repeats instant
+
+
+def _is_bot_check(e: Exception) -> bool:
+    m = str(e).lower()
+    return "not a bot" in m or "sign in to confirm" in m
+
+
+def _yt_attempts() -> list[dict]:
     attempts = list(YT_ATTEMPTS)
     # If ordinary extraction is challenged, try importing an already-authenticated
     # browser profile. This cannot create a Google login or bypass verification.
     for browser_spec in _browser_cookie_specs():
         attempts.append({"browser": browser_spec, "cookies": False})
-    if not COOKIES:
-        specs = _browser_cookie_specs()
-        if not specs:
-            log("no YouTube cookie file or logged-in browser profile found; "
-                "set COOKIES_BASE64/COOKIES_TXT or provide an authenticated browser profile")
-    for a in attempts:
+    return attempts
+
+
+def _yt_extract(url: str) -> dict:
+    """Resolve ONE video url to a stream, trying each client strategy in turn."""
+    last: Exception | None = None
+    for a in _yt_attempts():
         try:
             entries = _ydl_entries(
-                _ydl_opts(a.get("cookies", True), a.get("clients"), a.get("browser")), target
+                _ydl_opts(a.get("cookies", True), a.get("clients"), a.get("browser")), url
             )
-            if search_query:
-                entries = sorted(
-                    entries,
-                    key=lambda e: _match_score(
-                        search_query, e.get("title", ""),
-                        e.get("artist") or e.get("uploader") or e.get("channel", "")
-                    ),
-                    reverse=True,
-                )
-            for entry in entries:
-                info = _norm(entry, "youtube")
-                if search_query and (
-                    not _relevant(search_query, info["title"], info["artist"])
-                    or _variant_unwanted(search_query, info["title"], info["artist"])
-                    or _match_score(search_query, info["title"], info["artist"]) < 5.0
-                ):
-                    continue
-                try:
-                    return _finish(info)
-                except Exception as e:
-                    last = e
-            if search_query:
-                last = NotFound("youtube: no acceptable search result")
-                continue
+            return _finish(_norm(entries[0], "youtube"))
         except NotFound as e:
             last = e
-            continue
         except Exception as e:
             last = e
             log("youtube attempt failed:", str(e)[:160])
     raise last or RuntimeError("youtube failed")
+
+
+def _youtube(target: str) -> dict:
+    cached = _YT_CACHE.get(target)
+    if cached and time.time() - cached[0] < _YT_CACHE_TTL:
+        return cached[1]
+    if not COOKIES and not _browser_cookie_specs():
+        log("no YouTube cookie file or logged-in browser profile found; "
+            "set COOKIES_BASE64/COOKIES_TXT or provide an authenticated browser profile")
+    m = re.match(r"ytsearch\d*:(.*)", target, re.I)
+    if not m:
+        # Direct user-provided YouTube links are resolved as requested.
+        info = _yt_extract(target)
+        _YT_CACHE[target] = (time.time(), info)
+        return info
+
+    # Search is a cheap flat listing: it needs no player request, so it is fast
+    # and is not hit by the "confirm you're not a bot" check. Only the chosen
+    # candidates go through full stream extraction (previously all 10 did).
+    search_query = m.group(1).strip()
+    opts = _ydl_opts(cookies=False)
+    opts["extract_flat"] = True
+    entries = _ydl_entries(opts, target)
+
+    def artist_of(e):
+        return e.get("artist") or e.get("uploader") or e.get("channel") or ""
+
+    ranked = sorted(entries, key=lambda e: _match_score(search_query, e.get("title", ""), artist_of(e)),
+                    reverse=True)
+    candidates = [
+        e for e in ranked
+        if _relevant(search_query, e.get("title", ""), artist_of(e))
+        and not _variant_unwanted(search_query, e.get("title", ""), artist_of(e))
+        and _match_score(search_query, e.get("title", ""), artist_of(e)) >= 5.0
+    ][:3]
+    if not candidates:
+        raise NotFound("youtube: no acceptable search result")
+    last: Exception | None = None
+    for e in candidates:
+        vid = e.get("id")
+        url = e.get("webpage_url") or (f"https://www.youtube.com/watch?v={vid}" if vid else e.get("url"))
+        try:
+            info = _yt_extract(url)
+        except Exception as err:
+            last = err
+            if _is_bot_check(err):
+                raise  # same block applies to every candidate; fail fast
+            continue
+        _YT_CACHE[target] = (time.time(), info)
+        return info
+    raise last or NotFound("youtube: no playable result")
 
 
 def _soundcloud(q: str) -> dict:
