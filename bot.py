@@ -27,6 +27,7 @@ if _missing:
     sys.exit(2)
 
 from pyrogram import Client, filters, idle
+from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 from pyrogram.raw import functions
 from pyrogram.raw.types import InputStickerSetShortName
@@ -973,21 +974,47 @@ _NOOP_RESULTS = {
 }
 
 
-def _mention(user) -> str:
-    if not user:
-        return "Someone"
-    name = html.escape(user.first_name or user.username or "User")
-    if user.username:
-        return f"@{user.username}"
-    return f'<a href="tg://user?id={user.id}">{name}</a>'
+def _mention_html(name: str, user_id, username: str | None = None) -> str:
+    """Fallback HTML mention: username mention first, then clickable name link."""
+    if username:
+        return f"@{username}"
+    if user_id:
+        return f'<a href="tg://user?id={user_id}">{html.escape(name)}</a>'
+    return html.escape(name)
 
 
-def _plain_mention(user) -> str:
+def _plain_mention(name: str, username: str | None = None) -> str:
+    return f"@{username}" if username else name
+
+
+def _utf16_len(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+async def _actor_name(user) -> tuple[str, str | None, int | None]:
+    """Get a full name even when a callback only carries a user id."""
     if not user:
-        return "Someone"
-    if user.username:
-        return f"@{user.username}"
-    return user.first_name or "User"
+        return "Someone", None, None
+    uid = getattr(user, "id", None)
+    name = (getattr(user, "first_name", "") or getattr(user, "title", "") or "").strip()
+    username = (getattr(user, "username", "") or "").strip() or None
+    if uid and not name:
+        # The assistant user session shares the group and can resolve users even
+        # when the bot client only received a sparse callback user object.
+        for client_name, client in (("assistant", assistant), ("bot", bot)):
+            try:
+                full = await asyncio.wait_for(client.get_users(uid), timeout=3)
+                name = (getattr(full, "first_name", "") or getattr(full, "title", "") or "").strip()
+                username = (getattr(full, "username", "") or "").strip() or username
+                if name:
+                    print(f"resolved button user via {client_name}: {uid}", flush=True)
+                    break
+            except Exception as e:
+                print(f"{client_name} could not resolve button user {uid}:", repr(e)[:120], flush=True)
+    if not name:
+        name = username or (f"User {uid}" if uid else "Someone")
+    name = " ".join(name.split())
+    return name, username, uid
 
 
 def _action_phrase(action: str, result: str) -> str:
@@ -1008,8 +1035,30 @@ def _action_phrase(action: str, result: str) -> str:
 async def action_notice(chat_id: int, user, action: str, result: str, thread_id: int | None = None):
     """Post a separate English attribution line under the card for every button press."""
     phrase = _action_phrase(action, result)
-    text = f"{pe('user', True)} {_mention(user)} {phrase}."
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    name, username, uid = await _actor_name(user)
+    prefix = f"{pe('user', True)} "
+    text = f"{prefix}{name} {phrase}."
+
+    if uid:
+        actor = {"id": uid, "is_bot": bool(getattr(user, "is_bot", False)), "first_name": name}
+        if username:
+            actor["username"] = username
+        entity = {
+            "type": "text_mention",
+            "offset": _utf16_len(prefix),
+            "length": _utf16_len(name),
+            "user": actor,
+        }
+        payload = {"chat_id": chat_id, "text": text, "entities": [entity]}
+        if thread_id:
+            payload["message_thread_id"] = thread_id
+        res = await api("sendMessage", payload)
+        if res.get("ok"):
+            return
+        print("action notice text_mention failed:", res.get("description"), flush=True)
+
+    html_text = f"{prefix}{_mention_html(name, uid, username)} {phrase}."
+    payload = {"chat_id": chat_id, "text": html_text, "parse_mode": "HTML"}
     if thread_id:
         payload["message_thread_id"] = thread_id
     res = await api("sendMessage", payload)
@@ -1017,7 +1066,16 @@ async def action_notice(chat_id: int, user, action: str, result: str, thread_id:
         return
 
     print("action notice failed:", res.get("description"), flush=True)
-    plain = f"👤 {_plain_mention(user)} {phrase}."
+    try:
+        kwargs = {"parse_mode": ParseMode.HTML}
+        if thread_id:
+            kwargs["message_thread_id"] = thread_id
+        await assistant.send_message(chat_id, html_text, **kwargs)
+        return
+    except Exception as e:
+        print("action notice assistant fallback failed:", repr(e)[:160], flush=True)
+
+    plain = f"👤 {_plain_mention(name, username)} {phrase}."
     fallback = {"chat_id": chat_id, "text": plain}
     if thread_id:
         fallback["message_thread_id"] = thread_id
