@@ -1,8 +1,7 @@
 """Entry point (Railway / Procfile / Docker).
 
 * answers Railway's health check on $PORT right away,
-* runs bot.py and restarts it forever if it ever stops (with a growing delay, so a crash loop can't spam),
-* keeps yt-dlp up to date (YouTube changes constantly).
+* runs bot.py and restarts it forever if it ever stops (with a growing delay, so a crash loop can't spam).
 """
 import json
 import os
@@ -52,23 +51,6 @@ def serve_health():
         log("health server not started:", e)
 
 
-# ── yt-dlp updater ────────────────────────────────────────────
-_last_update = 0.0
-
-
-def update_ytdlp():
-    global _last_update
-    if os.environ.get("AUTO_UPDATE_YTDLP", "1") == "0" or time.time() - _last_update < 6 * 3600:
-        return
-    _last_update = time.time()
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-U", "--no-cache-dir", "-q", "yt-dlp[default]"],
-                       timeout=120, check=False)
-        log("yt-dlp is up to date")
-    except Exception as e:
-        log("yt-dlp update skipped:", e)
-
-
 # ── shutdown ──────────────────────────────────────────────────
 def shutdown(*_):
     """Railway sends SIGTERM on redeploy: stop the bot at once so two copies never share one session."""
@@ -108,7 +90,6 @@ def main():
             config.load_env()
             continue
 
-        update_ytdlp()
         started = time.time()
         state["bot"] = "running"
         log("starting bot.py")

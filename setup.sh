@@ -8,7 +8,7 @@ sudo apt-get install -y python3 python3-venv python3-pip ffmpeg nodejs
 python3 -m venv venv
 ./venv/bin/pip install -U pip
 ./venv/bin/pip uninstall -y pyrogram >/dev/null 2>&1 || true
-./venv/bin/pip install -r requirements.txt "yt-dlp[default]"
+./venv/bin/pip install -r requirements.txt
 
 sudo tee /etc/systemd/system/musicbot.service >/dev/null <<EOF
 [Unit]
