@@ -77,10 +77,18 @@ Now-playing card:
 - The official upload's HD artwork (`maxresdefault`, then `maxres1/2/3`, then sd/hq fallbacks)
   is sent as a photo. The caption is the player, and the 2×3 buttons sit directly below it in the
   same bubble.
-- Title, artist and requester are clipped to one line each, so long names cannot push the card out
-  of shape.
+- Caption layout: `🎵 title`, blank line, player state, blank line, `👤 requester`. There is no
+  separate channel/artist line, so the card stays compact.
+- Playing shows the progress bar; paused, playback-ended and completed show a status line instead.
+- Buttons are colour-coded by row: green for Prev/Pause, blue for Skip/Shuffle, red for Loop/Stop.
+- After playback ends, completes or is stopped, the buttons are removed and only the photo plus the
+  final status text remain.
+- Title and requester are clipped to one line each, so long names cannot push the card out of shape.
 - If a lyrics upload is the only fallback, the card still uses the official song's artwork.
 - If Telegram cannot fetch a photo, the bot falls back to the same compact text card.
+- Skip/force replace the stream without leaving the voice chat. A short grace period ignores the
+  old stream's end event, and a start watchdog retries if the call stays idle, so replacing a song
+  does not cut the new song's audio.
 
 It can also try importing cookies from an already logged-in browser profile
 (`COOKIES_FROM_BROWSER=auto`, or e.g. `chrome:Default`). This only imports an existing session; it

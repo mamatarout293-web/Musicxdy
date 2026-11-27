@@ -10,6 +10,7 @@ import logging
 import json
 import os
 import random
+import re
 import sys
 import time
 import urllib.error
@@ -34,7 +35,7 @@ from pyrogram.types import (
     Message,
 )
 from pytgcalls import PyTgCalls, filters as call_filters
-from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
+from pytgcalls.types import AudioQuality, Call, MediaStream, StreamEnded
 
 # FFmpeg DEBUG output floods the logs (HLS reconnect/playlist lines many times a second).
 logging.getLogger('ffmpeg').setLevel(logging.WARNING)
@@ -94,11 +95,25 @@ class Track:
     thumbs: list = field(default_factory=list)  # official HD artwork URLs, best first
     official: bool = False
     has_photo: bool = False
+    end_state: str = ""  # "", "ended", "completed", "stopped"
+    final_elapsed: int = 0
+    end_seen: bool = False
+    ignore_end_until: float = 0.0
+    start_token: int = 0
 
 
 queues: dict[int, list[Track]] = {}
 history: dict[int, list[Track]] = {}
 loop: dict[int, bool] = {}
+advance_locks: dict[int, asyncio.Lock] = {}
+background_tasks: set[asyncio.Task] = set()
+
+
+def spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return task
 
 
 def fmt(sec: int) -> str:
@@ -133,15 +148,16 @@ PACKS = [p.strip() for p in os.environ.get(
 
 # role -> (default emoji, alternatives to look for in the packs)
 ROLES = {
+    "song": ("🎵", ["🎵", "🎶", "🎧"]),
     "now": ("🎧", ["🎧", "🎵", "🎶"]),
-    "pause": ("⏸", ["⏸", "⏯"]),
+    "pause": ("⏸️", ["⏸️", "⏸", "⏯️"]),
     "play": ("▶️", ["▶️", "▶", "🎶"]),
     "user": ("👤", ["👤", "🙋", "👑"]),
     "prev": ("⏮", ["⏮", "◀️", "⬅️"]),
     "skip": ("⏭", ["⏭", "⏩", "➡️"]),
     "shuffle": ("🔀", ["🔀", "🔄"]),
     "loop": ("🔁", ["🔁", "🔂", "♻️"]),
-    "stop": ("⏹", ["⏹", "🛑", "❌"]),
+    "stop": ("⏹️", ["⏹️", "⏹", "🛑", "❌"]),
     "queue": ("📥", ["📥", "📋", "📝"]),
 }
 EMO: dict[str, tuple[str, str]] = {}  # role -> (char, custom_emoji_id or "")
@@ -182,6 +198,8 @@ def pe(role: str, plain: bool = False) -> str:
 
 
 def elapsed(t: Track) -> int:
+    if not t.started:
+        return 0
     now = t.paused_at or time.time()
     return max(0, min(int(now - t.started), t.duration or 10**9))
 
@@ -191,22 +209,41 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:max(0, limit - 1)].rstrip() + "…"
 
 
+_TITLE_BRACKETS = re.compile(r"\s*[\(\[\{][^\)\]\}]*[\)\]\}]\s*")
+_TITLE_TAIL = re.compile(
+    r"\s+(?:official(?:\s+(?:music\s+)?(?:video|audio))?|"
+    r"full\s+(?:video|song)|video\s+song|lyrics?|lyrical|audio|"
+    r"8k|4k|hd|hq)\s*$", re.I)
+
+
+def _display_title(title: str) -> str:
+    raw = (title or "").strip()
+    text = raw.split("|", 1)[0].strip()
+    text = _TITLE_BRACKETS.sub(" ", text)
+    for _ in range(2):
+        text = _TITLE_TAIL.sub("", text).strip()
+    text = re.sub(r"\s{2,}", " ", text).strip(" -–—:•")
+    return text or raw or "Unknown"
+
+
 def card(t: Track, plain: bool = False) -> str:
-    e, d = elapsed(t), t.duration
+    d = t.duration
+    e = t.final_elapsed if t.end_state else elapsed(t)
     filled = round(10 * e / d) if d else 0
     bar = "▰" * filled + "▱" * (10 - filled)
-    icon = pe("pause", plain) if t.paused_at else pe("play", plain)
-    head = f"{pe('pause', plain)} <b>PAUSED</b>" if t.paused_at else f"{pe('now', plain)} <b>NOW PLAYING</b>"
-    # Fixed five-line caption: one line each for title, artist and requester.
-    # Clipping keeps the photo bubble the same rectangle for every song.
-    title = html.escape(_clip(t.title.upper(), 34))
-    artist = html.escape(_clip(t.artist or "Unknown artist", 30))
+    title = html.escape(_clip(_display_title(t.title).upper(), 34))
     by = html.escape(_clip(t.by, 20))
-    return (
-        f"{head}\n<b>{title}</b>\n{artist}\n"
-        f"{icon}  {bar}  <code>{fmt(e)} / {fmt(d)}</code>\n"
-        f"{pe('user', plain)} {by}"
-    )
+    if t.end_state == "completed":
+        status = f"{pe('stop', plain)} COMPLETED • {fmt(d)} / {fmt(d)}"
+    elif t.end_state == "ended":
+        status = f"{pe('stop', plain)} PLAYBACK ENDED • {fmt(e)} / {fmt(d)}"
+    elif t.end_state == "stopped":
+        status = f"{pe('stop', plain)} STOPPED • {fmt(e)} / {fmt(d)}"
+    elif t.paused_at:
+        status = f"{pe('pause', plain)} PAUSED • {fmt(e)} / {fmt(d)}"
+    else:
+        status = f"{pe('play', plain)}  {bar}  {fmt(e)} / {fmt(d)}"
+    return f"{pe('song', plain)} {title}\n\n{status}\n\n{pe('user', plain)} {by}"
 
 
 def _call(method: str, payload: dict) -> dict:
@@ -219,7 +256,13 @@ def _call(method: str, payload: dict) -> dict:
         with urllib.request.urlopen(req, timeout=20) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:
-        return json.load(e)
+        try:
+            return json.load(e)
+        except Exception:
+            return {"ok": False, "description": f"HTTP {e.code}"}
+    except Exception as e:
+        # A Telegram timeout must not abort playback or skip the current track.
+        return {"ok": False, "description": f"{type(e).__name__}: {e}"[:200]}
 
 
 async def api(method: str, payload: dict, fallback_markup: dict | None = None) -> dict:
@@ -245,32 +288,41 @@ def kb(chat_id: int, t: Track, plain: bool = False) -> dict:
     on = loop.get(chat_id)
     # Two buttons per row: labels never overflow the photo bubble on a narrow phone.
     return {"inline_keyboard": [
-        [B("prev", "Prev", "prev", "primary"), pause],
+        [B("prev", "Prev", "prev", "success"), pause],
         [B("skip", "Skip", "skip", "primary"), B("shuffle", "Shuffle", "shuffle", "primary")],
-        [B("loop", "Loop ✓" if on else "Loop", "loop", "success" if on else "primary"),
+        [B("loop", "Loop ✓" if on else "Loop", "loop", "danger"),
          B("stop", "Stop", "stop", "danger")],
     ]}
 
 
 async def refresh(chat_id: int, t: Track):
+    final = bool(t.end_state)
+    markup = {"inline_keyboard": []} if final else kb(chat_id, t)
+    plain_markup = {"inline_keyboard": []} if final else kb(chat_id, t, plain=True)
     if t.has_photo:
         res = await api("editMessageCaption", {
             "chat_id": chat_id, "message_id": t.msg,
             "caption": card(t), "parse_mode": "HTML",
-            "reply_markup": kb(chat_id, t),
-        }, kb(chat_id, t, plain=True))
+            "reply_markup": markup,
+        }, plain_markup)
         if not res.get("ok") and "not modified" not in str(res.get("description", "")):
             await api("editMessageCaption", {
                 "chat_id": chat_id, "message_id": t.msg,
                 "caption": card(t, plain=True), "parse_mode": "HTML",
-                "reply_markup": kb(chat_id, t, plain=True),
+                "reply_markup": plain_markup,
             })
         return
-    await api("editMessageText", {
+    res = await api("editMessageText", {
         "chat_id": chat_id, "message_id": t.msg, "text": card(t),
-        "parse_mode": "HTML", "reply_markup": kb(chat_id, t),
+        "parse_mode": "HTML", "reply_markup": markup,
         "link_preview_options": {"is_disabled": True},
-    }, kb(chat_id, t, plain=True))
+    }, plain_markup)
+    if not res.get("ok") and "not modified" not in str(res.get("description", "")):
+        await api("editMessageText", {
+            "chat_id": chat_id, "message_id": t.msg, "text": card(t, plain=True),
+            "parse_mode": "HTML", "reply_markup": plain_markup,
+            "link_preview_options": {"is_disabled": True},
+        })
 
 
 async def updater(t: Track):
@@ -314,13 +366,48 @@ async def start_stream(chat_id: int, t: Track, seek_to: int | None = None):
     # Preserve provider headers; silently dropping Referer/User-Agent can turn a valid
     # stream into an HTTP error or an apparently silent playback.
     stream = MediaStream(t.url, headers=t.headers, **kw)
+    t.end_seen = False
+    t.end_state = ""
+    t.final_elapsed = 0
+    # Suppress the previous stream's end event while this start/replacement is in flight.
+    t.ignore_end_until = time.time() + 3.0
+    t.start_token += 1
+    token = t.start_token
+    try:
+        # A previous track may have been paused. Resume before replacing it, otherwise
+        # some clients keep the new stream silent until the user presses Resume.
+        await calls.resume(chat_id)
+    except Exception:
+        pass
     try:
         await calls.play(chat_id, stream)
     except Exception as e:
         print("calls.play failed:", repr(e), flush=True)
-        raise
+        if _is_call_setup_error(e):
+            try:
+                await ensure_assistant_in_group(chat_id)
+            except Exception as join_error:
+                print("assistant rejoin before retry failed:", repr(join_error)[:140], flush=True)
+            try:
+                # Clear a stale voice-chat state ("not a participant") before rejoining.
+                await calls.leave_call(chat_id)
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+            t.ignore_end_until = time.time() + 3.0
+            try:
+                await calls.play(chat_id, stream)
+            except Exception as retry_error:
+                print("calls.play retry failed:", repr(retry_error), flush=True)
+                raise
+        else:
+            raise
     t.started = time.time() - (seek_to or 0)
     t.paused_at = 0.0
+    # Replacing a stream makes the old stream emit StreamEnded. Ignore that stale
+    # event briefly, otherwise it advances the brand-new track and cuts the sound.
+    t.ignore_end_until = time.time() + 3.0
+    spawn(watch_start(chat_id, t, token))
 
 
 def _is_call_setup_error(error: Exception) -> bool:
@@ -338,6 +425,45 @@ def _is_call_setup_error(error: Exception) -> bool:
     return any(token in name for token in known_types) or any(
         token in message for token in known_messages
     )
+
+
+async def watch_start(chat_id: int, t: Track, token: int):
+    """Catch a silent start: if the call is idle after a few seconds, retry once."""
+    await asyncio.sleep(3.0)
+    lock = advance_locks.setdefault(chat_id, asyncio.Lock())
+    retry = False
+    async with lock:
+        if t.start_token != token:
+            return
+        q = queues.get(chat_id)
+        if not q or q[0] is not t or t.end_seen:
+            return
+        try:
+            states = await asyncio.wait_for(calls.calls, timeout=3)
+            state = states.get(chat_id) if hasattr(states, "get") else None
+        except Exception:
+            return
+        if state is not None and state.playback != Call.Status.IDLE:
+            return
+        print("no active playback after start; retrying:", t.title, flush=True)
+        if t.retries >= 3:
+            retry = True
+        else:
+            t.retries += 1
+            t.end_seen = True
+            if t.source:
+                t.bad.add(t.source)
+            try:
+                await start_with_fallback(chat_id, t)
+                return
+            except Exception as e:
+                print("retry after idle failed:", repr(e)[:160], flush=True)
+                retry = True
+    if retry:
+        try:
+            await play_next(chat_id, force=True)
+        except Exception as e:
+            print("advance after idle failed:", repr(e)[:160], flush=True)
 
 
 async def start_with_fallback(chat_id: int, t: Track):
@@ -416,6 +542,33 @@ async def announce(chat_id: int, t: Track, message_id: int | None = None) -> int
 def finish(t: Track):
     if t.task:
         t.task.cancel()
+        t.task = None
+
+
+async def finalize_track(t: Track, state: str = ""):
+    """Freeze the card (and remove its buttons) when a track ends, completes or stops."""
+    token = t.start_token
+    q = queues.get(t.chat_id)
+    if q and q[0] is t and not t.end_state:
+        return  # this track was replayed before the background cleanup ran
+    if t.start_token != token:
+        return
+    t.end_seen = True
+    if state and not t.end_state:
+        t.end_state = state
+    if not t.end_state:
+        t.end_state = "ended"
+    if not t.final_elapsed:
+        t.final_elapsed = t.duration if t.end_state == "completed" else elapsed(t)
+    if t.start_token != token:
+        return
+    finish(t)
+    if not t.msg:
+        return
+    try:
+        await refresh(t.chat_id, t)
+    except Exception as e:
+        print("final card update failed:", repr(e)[:140], flush=True)
 
 
 async def notify(chat_id: int, text: str):
@@ -435,30 +588,62 @@ async def leave(chat_id: int):
 
 async def play_next(chat_id: int, force: bool = False):
     """Advance the queue. A track that can't be played is skipped - the queue never gets stuck."""
-    q = queues.get(chat_id, [])
-    if q and loop.get(chat_id) and not force:
-        try:
-            await start_with_fallback(chat_id, q[0])  # replay same track, same card
+    lock = advance_locks.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        q = queues.get(chat_id, [])
+        if q and loop.get(chat_id) and not force:
+            t = q[0]
+            t.end_state = ""
+            t.final_elapsed = 0
+            t.end_seen = False
+            t.ignore_end_until = 0.0
+            try:
+                await asyncio.sleep(0.15)
+                await start_with_fallback(chat_id, t)  # replay same track, same card
+            except Exception as e:
+                print("loop replay failed:", repr(e)[:200], flush=True)
+            else:
+                try:
+                    await refresh(chat_id, t)
+                except Exception as e:
+                    print("loop card refresh failed:", repr(e)[:140], flush=True)
+                return
+        while True:
+            done = None
+            if q:
+                done = q.pop(0)
+                done.end_seen = True
+                if q:
+                    # Protect the next track from the old stream's end event while it starts.
+                    q[0].end_seen = False
+                    q[0].ignore_end_until = time.time() + 3.0
+                if done.started:
+                    history.setdefault(chat_id, []).append(done)
+                    del history[chat_id][:-20]
+            if not q:
+                await leave(chat_id)
+                if done:
+                    spawn(finalize_track(done))
+                return
+            try:
+                await asyncio.sleep(0.15)
+                await start_with_fallback(chat_id, q[0])
+            except Exception as e:
+                if done:
+                    await finalize_track(done)
+                print("could not play, skipping:", q[0].title, repr(e)[:200], flush=True)
+                await notify(chat_id, f"Couldn't play \"{q[0].title}\", skipping it.")
+                continue
+            if done:
+                # Card cleanup is cosmetic; do it in the background so it cannot delay
+                # the next track's audio.
+                spawn(finalize_track(done))
+            try:
+                await announce(chat_id, q[0])
+            except Exception as e:
+                # The card is cosmetic; never skip a track that is already playing.
+                print("card send failed, playback continues:", repr(e)[:160], flush=True)
             return
-        except Exception as e:
-            print("loop replay failed:", repr(e)[:200], flush=True)
-    while True:
-        if q:
-            done = q.pop(0)
-            finish(done)
-            if done.started:
-                history.setdefault(chat_id, []).append(done)
-                del history[chat_id][:-20]
-        if not q:
-            await leave(chat_id)
-            return
-        try:
-            await start_with_fallback(chat_id, q[0])
-            await announce(chat_id, q[0])
-            return
-        except Exception as e:
-            print("could not play, skipping:", q[0].title, repr(e)[:200], flush=True)
-            await notify(chat_id, f"Couldn't play \"{q[0].title}\", skipping it.")
 
 
 async def handle_end(chat_id: int):
@@ -466,13 +651,33 @@ async def handle_end(chat_id: int):
     if not q:
         return
     t = q[0]
+    if t.ignore_end_until and time.time() < t.ignore_end_until:
+        print("ignoring stale stream-end event", flush=True)
+        return
+    if t.end_seen:
+        return
+    t.end_seen = True
+    now = elapsed(t)
+    if t.duration and now >= t.duration - 2:
+        t.end_state = "completed"
+        t.final_elapsed = t.duration
+    else:
+        t.end_state = "ended"
+        t.final_elapsed = now
     # Stream "ended" almost instantly although the song is long = the link was dead. Try another source.
     quick = bool(t.started) and not t.paused_at and (time.time() - t.started) < 4 and t.duration > 20
     if quick and t.retries < 3:
         t.retries += 1
-        t.bad.add(t.source)
+        if t.source:
+            t.bad.add(t.source)
         print(f"stream died right away ({t.source}), trying another source (try {t.retries})", flush=True)
+        t.end_state = ""
+        t.final_elapsed = 0
         try:
+            await asyncio.sleep(0.2)
+            q = queues.get(chat_id)
+            if not q or q[0] is not t or t.end_state:
+                return
             await start_with_fallback(chat_id, t)
             return
         except Exception as e:
@@ -501,16 +706,35 @@ async def act(chat_id: int, action: str) -> str:
         await refresh(chat_id, cur)
         return "▶️ Resumed"
     if action == "skip":
+        cur.end_seen = True
+        cur.end_state = "ended"
+        cur.final_elapsed = elapsed(cur)
         await play_next(chat_id, force=True)
         return "⏭ Skipped"
     if action == "prev":
-        h = history.get(chat_id)
-        if not h:
-            return "No previous song."
-        finish(cur)
-        q.insert(0, h.pop())
-        await start_with_fallback(chat_id, q[0])
-        await announce(chat_id, q[0])
+        lock = advance_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            h = history.get(chat_id)
+            if not h:
+                return "No previous song."
+            prev = h.pop()
+            cur.end_seen = True
+            cur.end_state = "ended"
+            cur.final_elapsed = elapsed(cur)
+            spawn(finalize_track(cur))
+            q[0] = prev
+            prev.end_state = ""
+            prev.final_elapsed = 0
+            prev.end_seen = False
+            prev.ignore_end_until = time.time() + 3.0
+            prev.retries = 0
+            prev.bad.clear()
+            await asyncio.sleep(0.15)
+            await start_with_fallback(chat_id, prev)
+            try:
+                await announce(chat_id, prev)
+            except Exception as e:
+                print("previous card send failed, playback continues:", repr(e)[:160], flush=True)
         return "⏮ Previous"
     if action == "shuffle":
         if len(q) < 3:
@@ -524,16 +748,19 @@ async def act(chat_id: int, action: str) -> str:
         await refresh(chat_id, cur)
         return "🔁 Loop on" if loop[chat_id] else "🔁 Loop off"
     if action == "stop":
-        for x in queues.pop(chat_id, []):
-            finish(x)
-        loop.pop(chat_id, None)
-        try:
-            await calls.leave_call(chat_id)
-        except Exception:
-            pass
-        await api("editMessageText", {"chat_id": chat_id, "message_id": cur.msg,
-                                      "text": f"{pe('stop')} <b>STOPPED</b>", "parse_mode": "HTML",
-                                      "reply_markup": {"inline_keyboard": []}})
+        lock = advance_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            for x in queues.pop(chat_id, []):
+                finish(x)
+            loop.pop(chat_id, None)
+            try:
+                await calls.leave_call(chat_id)
+            except Exception:
+                pass
+            cur.end_state = "stopped"
+            cur.final_elapsed = elapsed(cur)
+            cur.end_seen = True
+            await finalize_track(cur)
         return "⏹ Stopped"
     return ""
 
@@ -627,14 +854,15 @@ async def play_query(m: Message, force: bool = False):
     if force:
         previous = queues.pop(m.chat.id, [])
         for old in previous:
-            finish(old)
-        if previous:
-            try:
-                await calls.leave_call(m.chat.id)
-            except Exception as e:
-                print("forced stop failed:", repr(e)[:200], flush=True)
+            old.end_seen = True
+            # Final cards are updated in the background so /mxplayforce starts immediately.
+            spawn(finalize_track(old, "stopped"))
         q = queues.setdefault(m.chat.id, [])
         q.append(t)
+        t.end_seen = False
+        t.ignore_end_until = time.time() + 3.0
+        # Let the replaced stream stop before asking PyTgCalls to play the new one.
+        await asyncio.sleep(0.2)
     else:
         q = queues.setdefault(m.chat.id, [])
         q.append(t)
@@ -645,7 +873,11 @@ async def play_query(m: Message, force: bool = False):
         except Exception as e:
             q.clear()
             return await status.edit_text(f"Couldn't start playback. Make sure a voice chat is open and the assistant is in the group.\n{e}")
-        used = await announce(m.chat.id, t, message_id=status.id)
+        try:
+            used = await announce(m.chat.id, t, message_id=status.id)
+        except Exception as e:
+            print("card send failed, playback continues:", repr(e)[:160], flush=True)
+            used = 0
         if used != status.id:
             try:
                 await status.delete()
