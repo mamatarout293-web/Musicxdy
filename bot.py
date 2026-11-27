@@ -101,6 +101,8 @@ class Track:
     end_seen: bool = False
     ignore_end_until: float = 0.0
     start_token: int = 0
+    last_start_at: float = 0.0
+    last_start_url: str = ""
 
 
 queues: dict[int, list[Track]] = {}
@@ -343,6 +345,15 @@ async def updater(t: Track):
 
 
 async def start_stream(chat_id: int, t: Track, seek_to: int | None = None):
+    now = time.time()
+    if (seek_to is None and t.started and t.last_start_at
+            and t.url == t.last_start_url
+            and now - t.last_start_at < 8.0):
+        # A watchdog/source retry must not rewind a stream that already started.
+        print("ignoring duplicate start for:", t.title, flush=True)
+        return
+    t.last_start_at = now
+    t.last_start_url = t.url
     # 48 kHz stereo is exactly what Telegram voice chats use. AudioQuality.STUDIO
     # is 96 kHz and forces an extra resample; on a small Railway container that
     # causes underruns (crackling) without any audible benefit.
@@ -408,7 +419,8 @@ async def start_stream(chat_id: int, t: Track, seek_to: int | None = None):
     # Replacing a stream makes the old stream emit StreamEnded. Ignore that stale
     # event briefly, otherwise it advances the brand-new track and cuts the sound.
     t.ignore_end_until = time.time() + 8.0
-    spawn(watch_start(chat_id, t, token))
+    if os.environ.get("START_WATCHDOG", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        spawn(watch_start(chat_id, t, token))
 
 
 def _is_call_setup_error(error: Exception) -> bool:

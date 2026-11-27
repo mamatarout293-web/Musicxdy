@@ -69,7 +69,9 @@ Audio quality and start speed:
   available; arbitrary covers are never used as a fallback.
 - Audio-only formats are preferred (`bestaudio`, sorted by bitrate/sample rate); YouTube's muxed
   360p format 18 is accepted only as a last resort.
-- `MIN_AUDIO_KBPS` (default 120) rejects clearly low-bitrate streams before they are played.
+- The start watchdog is off by default. It used to replace a stream after a few seconds when
+  PyTgCalls briefly reported IDLE, which made songs restart from the beginning. Set
+  `START_WATCHDOG=1` only if you want automatic retries.
 - The last client strategy that produced a good stream is remembered and tried first, so the next
   song starts faster; repeated queries are cached for 30 minutes.
 - YouTube stream URLs are always probed before playback. A URL that resolves but returns 403 to
