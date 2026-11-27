@@ -34,6 +34,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
+from difflib import SequenceMatcher
 
 from yt_dlp import YoutubeDL
 
@@ -149,52 +150,158 @@ def _finish(info: dict, allow_low_quality: bool = False) -> dict:
     return info
 
 
-_STOP = {"official", "video", "audio", "lyrics", "lyric", "song", "full", "new", "hd", "the", "a", "of", "ft", "feat", "and", "by", "original", "version"}
+_STOP = {"official", "video", "audio", "lyrics", "lyric", "song", "full", "new", "hd",
+         "the", "a", "of", "ft", "feat", "and", "by", "original", "version", "music"}
 
 
 def _tokens(s: str) -> set[str]:
     return {t for t in re.findall(r"\w+", (s or "").lower()) if t not in _STOP}
 
 
+def _channel_tokens(s: str) -> set[str]:
+    # "ImagineDragonsVEVO" -> {"imagine", "dragons", "vevo"}
+    return _tokens(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s or ""))
+
+
+def _token_match(qt: str, ct: str) -> float:
+    if qt == ct:
+        return 1.0
+    if abs(len(qt) - len(ct)) > max(2, len(qt) // 3):
+        return 0.0
+    if len(qt) < 4 or len(ct) < 4:
+        if abs(len(qt) - len(ct)) > 1 or qt[:1] != ct[:1]:
+            return 0.0
+    return SequenceMatcher(None, qt, ct).ratio()
+
+
+def _coverage(query_tokens: set[str], have_tokens: set[str]) -> float:
+    if not query_tokens:
+        return 0.0
+    total = 0.0
+    for qt in query_tokens:
+        best = max((_token_match(qt, ct) for ct in have_tokens), default=0.0)
+        if best >= 0.8:
+            total += best
+    return total / len(query_tokens)
+
+
 def _relevant(query: str, title: str, artist: str = "") -> bool:
-    """Fail closed on weak matches: title + artist must identify the requested recording."""
+    """Fail closed on weak matches, but tolerate small spelling mistakes."""
     q = _tokens(query)
     if not q:
         return False
-    have = _tokens(f"{title} {artist}")
-    return len(q & have) / len(q) >= 0.75
+    return _coverage(q, _tokens(f"{title} {artist}")) >= 0.7
 
 
-_VARIANT = re.compile(
-    r"\b(?:mix(?:es)?|remix(?:es)?|mashup|medley|tiktok|reprised?|"
-    r"female\s+version|male\s+version|acoustic(?:\s+version)?|piano\s+version|"
-    r"lo[ -]?fi|fan[ -]?made|bootleg|rework|flip|sped\s*up|slowed(?:\s*\+\s*reverb)?|"
-    r"nightcore|8d|karaoke|cover|live|instrumental|bass\s*boosted|extended|dj\s*set|"
-    r"lyrics?\s*video)\b", re.I
+# Hard variants are never played unless the user typed the keyword themselves.
+_VARIANT_HARD = re.compile(
+    r"\b(?:mix(?:es)?|remix(?:es)?|mashup|medley|tiktok|tik\s*tok|"
+    r"reprised?|female\s+version|male\s+version|"
+    r"acoustic(?:\s+version)?|piano\s+version|"
+    r"lo[ -]?fi|fan[ -]?made|bootleg|rework|flip|"
+    r"sped\s*up|speed\s*up|slowed(?:\s*\+\s*reverb)?|reverb|"
+    r"nightcore|8d(?:\s+audio)?|karaoke|cover|live|instrumental|"
+    r"bass\s*boost(?:ed)?|extended|dj\s*set|"
+    r"edit(?:s|ed)?|status|whatsapp|shorts?|"
+    r"reaction|parody|amv|anime|"
+    r"ringtone|teaser|trailer|behind\s+the\s+scenes|"
+    r"1\s*hour|hour\s+loop|loop|"
+    r"ai\s*(?:cover|version)|"
+    r"video\s*edit|fan\s*edit|"
+    r"concert|festival|performance|unplugged|remake|"
+    r"interview|podcast)\b", re.I
+)
+# Lyrics videos are a softer fallback: used only when nothing official exists.
+_VARIANT_SOFT = re.compile(r"\b(?:lyrics?|lyric\s*video)\b", re.I)
+_OFFICIAL_TITLE = re.compile(
+    r"\b(?:official\s*(?:music\s*)?(?:video|audio|visuali[sz]er)|"
+    r"official\s+(?:lyric|lyrics)\s*video|official)\b", re.I
 )
 
 
-def _variant_unwanted(query: str, title: str, artist: str = "") -> bool:
+def _query_allows_variant(query: str) -> bool:
+    """A user who explicitly typed 'remix'/'lyrics' is asking for that version."""
+    return bool(_VARIANT_HARD.search(query) or _VARIANT_SOFT.search(query))
+
+
+def _variant_unwanted(query: str, title: str, artist: str = "",
+                      allow_soft: bool = False) -> bool:
     """Reject alternate edits named in either the title or the publishing channel."""
-    if _VARIANT.search(query):
+    if _query_allows_variant(query):
         return False
-    return bool(_VARIANT.search(f"{title} {artist}"))
+    text = f"{title} {artist}"
+    if _VARIANT_HARD.search(text):
+        return True
+    if _VARIANT_SOFT.search(text):
+        # An official lyric video is still an official upload.
+        return not (allow_soft or _OFFICIAL_TITLE.search(title or ""))
+    return False
 
 
-def _match_score(query: str, title: str, artist: str = "") -> float:
+def _is_official(title: str, channel: str, query: str = "") -> bool:
+    """Best-effort detection of the artist's own upload or auto-generated Topic audio."""
+    ch = (channel or "").lower()
+    title = title or ""
+    if "topic" in ch or "vevo" in ch:
+        return True
+    if _OFFICIAL_TITLE.search(title):
+        return True
+    q = _tokens(query)
+    channel_tokens = _channel_tokens(channel)
+    if len(q) >= 2 and 2 <= len(channel_tokens) <= 4:
+        matched = sum(
+            1 for ct in channel_tokens
+            if any(_token_match(qt, ct) >= 0.8 for qt in q)
+        )
+        if matched == len(channel_tokens):
+            return True
+    return False
+
+
+def _match_score(query: str, title: str, artist: str = "",
+                 duration: float = 0, verified: bool = False) -> float:
     q = _tokens(query)
     t = _tokens(title)
     a = _tokens(artist)
     if not q:
         return 0.0
-    overlap = len(q & (t | a)) / len(q)
-    title_overlap = len(q & t) / len(q)
+    try:
+        duration = float(duration or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    overlap = _coverage(q, t | a)
+    title_overlap = _coverage(q, t)
     score = overlap * 5 + title_overlap * 2
     if q == t:
         score += 5
+    if _is_official(title, artist, query):
+        score += 6
+    if verified:
+        score += 1.5
+    if duration:
+        if duration < 90 or duration > 900:
+            score -= 4
+        elif 120 <= duration <= 600:
+            score += 1
     if _variant_unwanted(query, title, artist):
         score -= 20
     return score
+
+
+def _candidate_ok(query: str, entry: dict, min_coverage: float = 0.7,
+                  allow_soft: bool = False) -> bool:
+    title = entry.get("title") or ""
+    artist = entry.get("artist") or entry.get("uploader") or entry.get("channel") or ""
+    if _variant_unwanted(query, title, artist, allow_soft=allow_soft):
+        return False
+    try:
+        duration = float(entry.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    # Short clips are usually TikTok/Shorts edits; very long ones are loops.
+    if duration and (duration < 45 or duration > 1200):
+        return False
+    return _coverage(_tokens(query), _tokens(f"{title} {artist}")) >= min_coverage
 
 
 # ───────────────────────── cookies ─────────────────────────
@@ -546,6 +653,15 @@ def _is_cookie_error(e: Exception) -> bool:
     ))
 
 
+def _is_unavailable(e: Exception) -> bool:
+    """Permanent per-video errors: another client cannot fix these."""
+    m = str(e).lower()
+    return any(token in m for token in (
+        "video unavailable", "this video is not available", "private video",
+        "video has been removed", "removed by the uploader", "no longer available",
+    ))
+
+
 def _yt_attempts() -> list[dict]:
     # Cookie attempts are pointless without a loaded cookie file; skipping them
     # keeps a stale export from costing extra round-trips.
@@ -593,6 +709,8 @@ def _yt_extract(url: str) -> dict:
         except Exception as e:
             last = e
             log("youtube attempt failed:", str(e)[:160])
+            if _is_unavailable(e):
+                break
             if used_cookies and (_is_bot_check(e) or _is_cookie_error(e)):
                 # Same client, but without the possibly expired cookies.
                 try:
@@ -605,6 +723,8 @@ def _yt_extract(url: str) -> dict:
                 except Exception as retry_error:
                     last = retry_error
                     log("youtube retry without cookies failed:", str(retry_error)[:160])
+                    if _is_unavailable(retry_error):
+                        break
     raise last or RuntimeError("youtube failed")
 
 
@@ -643,19 +763,38 @@ def _youtube(target: str) -> dict:
     search_query = m.group(1).strip()
     entries = _search_entries(target)
 
-    def artist_of(e):
-        return e.get("artist") or e.get("uploader") or e.get("channel") or ""
+    def channel_of(e):
+        return e.get("channel") or e.get("uploader") or e.get("artist") or ""
 
-    ranked = sorted(entries, key=lambda e: _match_score(search_query, e.get("title", ""), artist_of(e)),
-                    reverse=True)
-    candidates = [
-        e for e in ranked
-        if _relevant(search_query, e.get("title", ""), artist_of(e))
-        and not _variant_unwanted(search_query, e.get("title", ""), artist_of(e))
-        and _match_score(search_query, e.get("title", ""), artist_of(e)) >= 5.0
-    ][:2]
+    # If the first page has no official upload, search once more with an
+    # official-audio bias. This is a cheap flat search, not a player request.
+    if not any(_is_official(e.get("title", ""), channel_of(e), search_query) for e in entries):
+        try:
+            extra = _search_entries(f"ytsearch10:{search_query} official audio")
+            seen = {e.get("id") for e in entries if e.get("id")}
+            entries += [e for e in extra if e.get("id") not in seen]
+        except Exception as e:
+            log("official search fallback failed:", str(e)[:100])
+
+    def score(e):
+        return _match_score(
+            search_query, e.get("title", ""), channel_of(e),
+            e.get("duration") or 0, bool(e.get("channel_is_verified")),
+        )
+
+    ranked = sorted(entries, key=score, reverse=True)
+    strict = [e for e in ranked if _candidate_ok(search_query, e, 0.7)]
+    relaxed = [e for e in ranked if _candidate_ok(search_query, e, 0.5, allow_soft=True)]
+    candidates: list[dict] = []
+    for e in strict[:3] + relaxed:
+        if e not in candidates:
+            candidates.append(e)
+        if len(candidates) >= 5:
+            break
     if not candidates:
         raise NotFound("youtube: no acceptable search result")
+    if not strict:
+        log("youtube: no official upload found, using a lyrics upload")
     last: Exception | None = None
     for e in candidates:
         vid = e.get("id")
@@ -848,7 +987,7 @@ def _build() -> list[Source]:
     # Spotify is used only to identify the canonical track; it does not provide audio streams.
     youtube_enabled = os.environ.get("ENABLE_YOUTUBE", "1").strip().lower() in {"1", "true", "yes", "on"}
     if youtube_enabled:
-        s.append(Source("youtube", lambda q: _youtube(f"ytsearch5:{q}")))
+        s.append(Source("youtube", lambda q: _youtube(f"ytsearch15:{q}")))
     # Alternate user uploads are disabled by default: they often return covers,
     # edits, or low-quality copies. Enable only as an explicit last-resort choice.
     if os.environ.get("ENABLE_ALTERNATE_SOURCES", "").strip().lower() in {"1", "true", "yes", "on"}:

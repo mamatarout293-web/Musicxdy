@@ -47,6 +47,14 @@ API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SESSION = os.environ["SESSION_STRING"]  # assistant account that joins the voice chat
 
+# 48 kHz stereo is what Telegram voice chats use. "medium" (36 kHz mono) is an
+# escape hatch for very small containers where encoding still crackles.
+AUDIO_QUALITY = {
+    "high": AudioQuality.HIGH,
+    "medium": AudioQuality.MEDIUM,
+    "low": AudioQuality.LOW,
+}.get(os.environ.get("AUDIO_QUALITY", "high").strip().lower(), AudioQuality.HIGH)
+
 # Every fresh bot login (auth.ImportBotAuthorization) counts toward Telegram's flood limit, and each
 # Railway deploy used to start with a brand-new in-memory session. Keep the bot session on disk
 # when a persistent directory exists (mount a Railway volume at /data, or set BOT_SESSION_DIR) so
@@ -256,14 +264,20 @@ async def updater(t: Track):
 
 
 async def start_stream(chat_id: int, t: Track, seek_to: int | None = None):
-    ffmpeg_parameters = t.ffmpeg_parameters
+    # 48 kHz stereo is exactly what Telegram voice chats use. AudioQuality.STUDIO
+    # is 96 kHz and forces an extra resample; on a small Railway container that
+    # causes underruns (crackling) without any audible benefit.
+    start = ["--audio", "---start"]
     if t.source == "youtube" and sources.YT_PROXY:
         # The stream link is bound to the proxy's IP, so ffmpeg must fetch it through it too.
-        ffmpeg_parameters = f"{ffmpeg_parameters or ''} --audio --start -http_proxy {sources.YT_PROXY}".strip()
+        start += ["-http_proxy", sources.YT_PROXY]
     if seek_to is not None:
-        ffmpeg_parameters = f"{ffmpeg_parameters or ''} --audio --start -ss {seek_to}".strip()
+        start += ["-ss", str(seek_to)]
+    if t.ffmpeg_parameters:
+        start.append(t.ffmpeg_parameters)
+    ffmpeg_parameters = " ".join(start)
     kw = dict(
-        audio_parameters=AudioQuality.STUDIO,  # 48 kHz stereo, top quality
+        audio_parameters=AUDIO_QUALITY,  # default 48 kHz stereo, matches Telegram
         video_flags=MediaStream.Flags.IGNORE,
         ffmpeg_parameters=ffmpeg_parameters,
     )
@@ -610,7 +624,7 @@ async def test_audio(_, m: Message):
         duration=8,
         by=m.from_user.first_name if m.from_user else "Unknown",
         source="test tone",
-        ffmpeg_parameters="--audio --start -f lavfi",
+        ffmpeg_parameters="-f lavfi",
         resolved_at=time.time(),
     )
     q = queues.setdefault(m.chat.id, [])

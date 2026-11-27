@@ -20,6 +20,7 @@ COOKIES_FROM_BROWSER=auto (optional; imports an existing browser profile when av
 ENABLE_ALTERNATE_SOURCES=1 (optional; allows Audius/SoundCloud fallback)
 MIN_AUDIO_KBPS=120 (optional; reject lower-bitrate formats)
 VERIFY_YOUTUBE=0 (optional; keep 0, YouTube URLs are IP-bound)
+AUDIO_QUALITY=high (optional; high = 48 kHz stereo, medium = 36 kHz mono fallback)
 ```
 3. Railway redeploys. Open **Deployments → View logs**; you should see `starting bot.py`.
 
@@ -42,6 +43,12 @@ Cookie handling is resilient:
 - A bad or expired export keeps the last good cookie file instead of clearing it.
 
 Audio quality and start speed:
+- Playback uses 48 kHz stereo, which is what Telegram voice chats use. The old 96 kHz
+  "studio" mode caused resampling underruns (crackling) on small containers.
+- Search is typo-tolerant (for example, `believr` still finds `Believer`).
+- Official artist / Topic / VEVO uploads rank first. Remixes, TikTok edits, slowed/reverb,
+  sped-up, covers, live, 8D, karaoke and similar variants are skipped unless you type that
+  keyword yourself. A lyrics upload is used only when no official upload is available.
 - Audio-only formats are preferred (`bestaudio`, sorted by bitrate/sample rate); YouTube's muxed
   360p format 18 is accepted only as a last resort.
 - `MIN_AUDIO_KBPS` (default 120) rejects clearly low-bitrate streams before they are played.

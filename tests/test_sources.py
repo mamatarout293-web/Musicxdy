@@ -367,5 +367,81 @@ class QualityGateTests(unittest.TestCase):
         self.assertEqual(attempts[0], good)
 
 
+class SearchMatchingTests(unittest.TestCase):
+    def test_typo_is_still_relevant(self):
+        self.assertTrue(sources._relevant(
+            "believr imagine dragns",
+            "Imagine Dragons - Believer (Official Music Video)",
+            "ImagineDragons",
+        ))
+
+    def test_short_typo_is_relevant(self):
+        self.assertTrue(sources._relevant(
+            "shape of yu", "Ed Sheeran - Shape of You (Official Music Video)"))
+
+    def test_remix_tiktok_edit_is_rejected(self):
+        for title in ("Believer (TikTok Remix)", "Believer (Slowed + Reverb)",
+                      "Believer (Sped Up)", "Believer (Cover)", "Believer (Live)",
+                      "Believer (WhatsApp Status)", "Believer (8D Audio)"):
+            self.assertTrue(sources._variant_unwanted("believer", title, ""), title)
+
+    def test_lyrics_rejected_until_relaxed(self):
+        title = "Imagine Dragons - Believer (Lyrics)"
+        self.assertTrue(sources._variant_unwanted("believer", title, "7clouds"))
+        self.assertFalse(sources._variant_unwanted(
+            "believer", title, "7clouds", allow_soft=True))
+
+    def test_official_upload_is_detected(self):
+        self.assertTrue(sources._is_official(
+            "Imagine Dragons - Believer (Official Music Video)",
+            "ImagineDragons", "believer imagine dragons"))
+        self.assertTrue(sources._is_official(
+            "Believer", "Imagine Dragons - Topic", "believer"))
+        self.assertFalse(sources._is_official(
+            "Believer (Lyrics)", "7clouds", "believer imagine dragons"))
+        self.assertFalse(sources._is_official(
+            "Believer", "Imagine Dragons Spain", "believer imagine dragons"))
+
+    def test_official_scores_above_lyrics_and_remix(self):
+        q = "believer imagine dragons"
+        official = sources._match_score(
+            q, "Imagine Dragons - Believer (Official Music Video)",
+            "ImagineDragons", 217, True)
+        lyrics = sources._match_score(
+            q, "Imagine Dragons - Believer (Lyrics)", "7clouds", 205, True)
+        remix = sources._match_score(
+            q, "Believer (TikTok Remix)", "edits", 30, False)
+        self.assertGreater(official, lyrics)
+        self.assertGreater(official, remix)
+
+    def test_candidate_filter_rejects_short_clips(self):
+        entry = {"title": "Believer (Official Audio)", "channel": "ImagineDragons",
+                 "duration": 30}
+        self.assertFalse(sources._candidate_ok("believer", entry))
+        entry["duration"] = 217
+        self.assertTrue(sources._candidate_ok("believer", entry))
+
+    def test_candidate_filter_rejects_remix_even_when_relaxed(self):
+        entry = {"title": "Believer (TikTok Remix)", "channel": "edits", "duration": 200}
+        self.assertFalse(sources._candidate_ok("believer", entry, 0.5, allow_soft=True))
+
+
+class YoutubeUnavailableTests(unittest.TestCase):
+    def test_permanent_unavailable_is_detected(self):
+        self.assertTrue(sources._is_unavailable(RuntimeError("Video unavailable")))
+        self.assertFalse(sources._is_unavailable(
+            RuntimeError("Sign in to confirm you're not a bot")))
+
+    def test_unavailable_video_does_not_retry_every_client(self):
+        with patch.object(sources, "_yt_attempts", return_value=[
+            {"clients": ["default"], "cookies": False},
+            {"clients": ["tv"], "cookies": False},
+        ]), patch.object(sources, "_ydl_entries",
+                         side_effect=RuntimeError("Video unavailable")) as ydl:
+            with self.assertRaises(RuntimeError):
+                sources._yt_extract("https://youtube.com/watch?v=example")
+        self.assertEqual(ydl.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
