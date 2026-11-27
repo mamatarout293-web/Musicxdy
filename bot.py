@@ -938,7 +938,7 @@ def _cmd(name: str, action: str):
             text = "Something went wrong."
         await m.reply_text(text)
         if m.from_user:
-            await action_notice(m.chat.id, m.from_user, action, text)
+            await action_notice(m.chat.id, m.from_user, action, text, getattr(m, "message_thread_id", None))
 
 
 for _n, _a in (("mxpause", "pause"), ("mxresume", "resume"), ("mxskip", "skip"),
@@ -982,6 +982,14 @@ def _mention(user) -> str:
     return f'<a href="tg://user?id={user.id}">{name}</a>'
 
 
+def _plain_mention(user) -> str:
+    if not user:
+        return "Someone"
+    if user.username:
+        return f"@{user.username}"
+    return user.first_name or "User"
+
+
 def _action_phrase(action: str, result: str) -> str:
     if action == "loop":
         if "Loop on" in result:
@@ -997,17 +1005,32 @@ def _action_phrase(action: str, result: str) -> str:
     return done
 
 
-async def action_notice(chat_id: int, user, action: str, result: str):
+async def action_notice(chat_id: int, user, action: str, result: str, thread_id: int | None = None):
     """Post a separate English attribution line under the card for every button press."""
+    phrase = _action_phrase(action, result)
+    text = f"{pe('user', True)} {_mention(user)} {phrase}."
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if thread_id:
+        payload["message_thread_id"] = thread_id
+    res = await api("sendMessage", payload)
+    if res.get("ok"):
+        return
+
+    print("action notice failed:", res.get("description"), flush=True)
+    plain = f"👤 {_plain_mention(user)} {phrase}."
+    fallback = {"chat_id": chat_id, "text": plain}
+    if thread_id:
+        fallback["message_thread_id"] = thread_id
+    res = await api("sendMessage", fallback)
+    if res.get("ok"):
+        return
+
+    print("action notice plain fallback failed:", res.get("description"), flush=True)
     try:
-        await api("sendMessage", {
-            "chat_id": chat_id,
-            "text": f"{pe('user', True)} {_mention(user)} {_action_phrase(action, result)}.",
-            "parse_mode": "HTML",
-            "link_preview_options": {"is_disabled": True},
-        })
+        kwargs = {"message_thread_id": thread_id} if thread_id else {}
+        await bot.send_message(chat_id, plain, **kwargs)
     except Exception as e:
-        print("action notice failed:", repr(e)[:140], flush=True)
+        print("action notice pyrogram fallback failed:", repr(e)[:160], flush=True)
 
 
 @bot.on_callback_query(filters.regex(r"^ctl:"))
@@ -1021,7 +1044,8 @@ async def buttons(_, cq: CallbackQuery):
         await cq.answer(text)
     except Exception:
         pass
-    await action_notice(cq.message.chat.id, cq.from_user, action, text)
+    await action_notice(cq.message.chat.id, cq.from_user, action, text,
+                        getattr(cq.message, "message_thread_id", None))
 
 
 @bot.on_message(filters.command("mxqueue") & filters.group)
