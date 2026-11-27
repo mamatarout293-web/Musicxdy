@@ -38,6 +38,58 @@ class ParallelResolveTests(unittest.TestCase):
                 release_slow.set()
 
 
+class YoutubeFirstResolveTests(unittest.TestCase):
+    def test_youtube_runs_before_alternate_sources(self):
+        calls = []
+
+        def youtube(_query):
+            calls.append("youtube")
+            return {"source": "youtube"}
+
+        def soundcloud(_query):
+            calls.append("soundcloud")
+            return {"source": "soundcloud"}
+
+        providers = [
+            sources.Source("youtube", youtube),
+            sources.Source("soundcloud", soundcloud),
+        ]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            with patch.object(sources, "SOURCES", providers), \
+                    patch.object(sources, "DEADLINE", 3), \
+                    patch.object(sources, "YOUTUBE_FIRST", True), \
+                    patch.object(sources, "_RESOLVER_POOL", pool):
+                result = sources.resolve("a song")
+
+        self.assertEqual(result["source"], "youtube")
+        self.assertEqual(calls, ["youtube"])
+
+    def test_alternate_runs_only_after_youtube_fails(self):
+        calls = []
+
+        def youtube(_query):
+            calls.append("youtube")
+            raise sources.NotFound("no youtube")
+
+        def soundcloud(_query):
+            calls.append("soundcloud")
+            return {"source": "soundcloud"}
+
+        providers = [
+            sources.Source("youtube", youtube),
+            sources.Source("soundcloud", soundcloud),
+        ]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            with patch.object(sources, "SOURCES", providers), \
+                    patch.object(sources, "DEADLINE", 3), \
+                    patch.object(sources, "YOUTUBE_FIRST", True), \
+                    patch.object(sources, "_RESOLVER_POOL", pool):
+                result = sources.resolve("a song")
+
+        self.assertEqual(result["source"], "soundcloud")
+        self.assertEqual(calls, ["youtube", "soundcloud"])
+
+
 class AudiusTests(unittest.TestCase):
     @patch("sources._audius_hosts", return_value=["https://first.example", "https://second.example"])
     @patch("sources.get_json")

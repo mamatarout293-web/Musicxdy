@@ -69,6 +69,9 @@ Audio quality and start speed:
   available; arbitrary covers are never used as a fallback.
 - Audio-only formats are preferred (`bestaudio`, sorted by bitrate/sample rate); YouTube's muxed
   360p format 18 is accepted only as a last resort.
+- YouTube is tried first by default: every configured proxy and candidate is checked before
+  Audius/SoundCloud are started. `YOUTUBE_FIRST_TIMEOUT` (default 40 seconds) reserves time for
+  the fallback; set `YOUTUBE_FIRST=0` to restore the old parallel search.
 - The start watchdog is off by default. It used to replace a stream after a few seconds when
   PyTgCalls briefly reported IDLE, which made songs restart from the beginning. Set
   `START_WATCHDOG=1` only if you want automatic retries.

@@ -15,6 +15,8 @@ Env options (all optional):
   COOKIES_TXT / COOKIES_BASE64   optional YouTube cookies (default: cookies.txt next to this file)
   COOKIES_FROM_BROWSER           auto-detect an existing logged-in browser profile, or set chrome[:profile],firefox,etc.
   ENABLE_YOUTUBE                  set to 0 to disable YouTube (enabled by default)
+  YOUTUBE_FIRST                   try every YouTube proxy/candidate before alternates (default 1)
+  YOUTUBE_FIRST_TIMEOUT           seconds reserved for YouTube before fallback (default 40)
   YT_PROXY / YT_PROXIES           comma-separated HTTP proxies for YouTube; rotated on failure
   YT_PROXY_COOLDOWN               seconds a failed proxy is skipped (default 300)
   RESOLVE_TIMEOUT   max seconds spent on one search (default 55)
@@ -46,6 +48,13 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like
       "Chrome/124.0 Safari/537.36")
 HTTP_TIMEOUT = 8
 DEADLINE = int(os.environ.get("RESOLVE_TIMEOUT", "55"))
+YOUTUBE_FIRST = os.environ.get("YOUTUBE_FIRST", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+try:
+    YOUTUBE_FIRST_TIMEOUT = max(5, int(os.environ.get("YOUTUBE_FIRST_TIMEOUT", "40") or 40))
+except ValueError:
+    YOUTUBE_FIRST_TIMEOUT = 40
 URL_RE = re.compile(r"^https?://", re.I)
 # Optional HTTP proxy list (ideally residential) used ONLY for YouTube. YouTube
 # stream links are locked to the IP that resolved them, so playback must use the
@@ -1499,13 +1508,13 @@ def resolve(query: str, skip=()) -> dict:
     healthy = [s for s in ordered if s.alive]
     cooling = [s for s in ordered if not s.alive]
 
-    def run_group(group: list[Source]) -> dict | None:
+    def run_group(group: list[Source], deadline: float = DEADLINE) -> dict | None:
         futures: dict[Future, Source] = {
             _RESOLVER_POOL.submit(_try_source, s, query): s for s in group
         }
         source_order = {s: i for i, s in enumerate(group)}
         while futures:
-            remaining = DEADLINE - (time.time() - t0)
+            remaining = deadline - (time.time() - t0)
             if remaining <= 0:
                 errors.append("timeout")
                 break
@@ -1530,11 +1539,28 @@ def resolve(query: str, skip=()) -> dict:
             future.cancel()
         return None
 
-    info = run_group(healthy)
+    youtube_tried = False
+
+    def run_priority(group: list[Source], include_youtube: bool = True) -> dict | None:
+        """Finish every YouTube proxy/candidate before starting alternate sources."""
+        nonlocal youtube_tried
+        if not YOUTUBE_FIRST:
+            return run_group(group)
+        youtube = [s for s in group if s.name == "youtube" and include_youtube]
+        others = [s for s in group if s.name != "youtube"]
+        if not youtube:
+            return run_group(others)
+        youtube_tried = True
+        info = run_group(youtube, min(DEADLINE, t0 + YOUTUBE_FIRST_TIMEOUT))
+        if info:
+            return info
+        return run_group(others) if others else None
+
+    info = run_priority(healthy)
     if info:
         return info
     if time.time() - t0 <= DEADLINE:
-        info = run_group(cooling)
+        info = run_priority(cooling, include_youtube=not youtube_tried)
         if info:
             return info
     raise Unavailable(errors)
