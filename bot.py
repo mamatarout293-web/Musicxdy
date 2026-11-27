@@ -991,12 +991,20 @@ def _utf16_len(value: str) -> int:
     return len(value.encode("utf-16-le")) // 2
 
 
+def _display_name(obj) -> str:
+    if not obj:
+        return ""
+    first = (getattr(obj, "first_name", "") or "").strip()
+    last = (getattr(obj, "last_name", "") or "").strip()
+    return " ".join(part for part in (first, last) if part) or (getattr(obj, "title", "") or "").strip()
+
+
 async def _actor_name(user) -> tuple[str, str | None, int | None]:
     """Get a full name even when a callback only carries a user id."""
     if not user:
         return "Someone", None, None
     uid = getattr(user, "id", None)
-    name = (getattr(user, "first_name", "") or getattr(user, "title", "") or "").strip()
+    name = _display_name(user)
     username = (getattr(user, "username", "") or "").strip() or None
     if uid and not name:
         # The assistant user session shares the group and can resolve users even
@@ -1004,7 +1012,7 @@ async def _actor_name(user) -> tuple[str, str | None, int | None]:
         for client_name, client in (("assistant", assistant), ("bot", bot)):
             try:
                 full = await asyncio.wait_for(client.get_users(uid), timeout=3)
-                name = (getattr(full, "first_name", "") or getattr(full, "title", "") or "").strip()
+                name = _display_name(full)
                 username = (getattr(full, "username", "") or "").strip() or username
                 if name:
                     print(f"resolved button user via {client_name}: {uid}", flush=True)
