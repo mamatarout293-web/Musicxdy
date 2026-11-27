@@ -25,8 +25,10 @@ RUN node --version
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
+RUN pip uninstall -y bgutil-ytdlp-pot-provider || true
 RUN pip install --upgrade --pre "yt-dlp[default]"
 RUN python -c "from yt_dlp import YoutubeDL; from yt_dlp.extractor.youtube.pot import provider; ydl = YoutubeDL({'quiet': True}); ydl.get_info_extractor('Youtube'); assert set(provider._pot_providers.value) == {'BgUtilHTTP'}; ydl.close()"
 
 COPY . .
+RUN python3 -c "import yt_dlp; yt_dlp.YoutubeDL()"
 CMD ["python", "main.py"]
