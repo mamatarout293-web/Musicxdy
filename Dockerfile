@@ -16,7 +16,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 # ffmpeg decodes audio for voice chat; native libraries support the PO token provider.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg gcc libc6-dev ca-certificates libstdc++6 \
+ && apt-get install -y --no-install-recommends ffmpeg gcc libc6-dev ca-certificates libstdc++6 libcairo2 libpango-1.0-0 libjpeg62-turbo libgif7 librsvg2-2 \
  && rm -rf /var/lib/apt/lists/*
 
 # Node 22 is used by yt-dlp EJS and the BgUtils token provider.
