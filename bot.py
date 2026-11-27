@@ -472,8 +472,8 @@ async def watch_start(chat_id: int, t: Track, token: int):
         else:
             t.retries += 1
             t.end_seen = True
-            if t.source:
-                t.bad.add(t.source)
+            # An idle state can be a slow ffmpeg connect, so keep the same source
+            # for the first retry instead of switching to a lower-quality fallback.
             try:
                 await start_with_fallback(chat_id, t)
                 return
