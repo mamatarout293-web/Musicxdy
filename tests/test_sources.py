@@ -83,12 +83,12 @@ class SourceOrderTests(unittest.TestCase):
 
 
 class YoutubePotTests(unittest.TestCase):
-    def test_ydl_opts_points_to_rust_cli_provider(self):
+    def test_ydl_opts_points_to_rust_http_provider(self):
         opts = sources._ydl_opts(clients=["tv"])
 
         self.assertEqual(
-            opts["extractor_args"]["youtubepot-bgutilcli"]["cli_path"],
-            ["/usr/local/bin/bgutil-pot"],
+            opts["extractor_args"]["youtubepot-bgutilhttp"]["base_url"],
+            ["http://127.0.0.1:4416"],
         )
         self.assertEqual(opts["extractor_args"]["youtube"]["player_client"], ["tv"])
 

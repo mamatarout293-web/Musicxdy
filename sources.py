@@ -274,7 +274,7 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
         "retries": 1,
         "extractor_retries": 1,
         "extractor_args": {
-            "youtubepot-bgutilcli": {"cli_path": ["/usr/local/bin/bgutil-pot"]},
+            "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
         },
     }
     if cookies and COOKIES:

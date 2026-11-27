@@ -22,7 +22,7 @@ ENABLE_ALTERNATE_SOURCES=1 (optional; allows Audius/SoundCloud fallback)
 
 YouTube authentication is deployment-dependent. The resolver reads `COOKIES_BASE64`, `COOKIES_TXT`, or a local `cookies.txt`. It can also try importing cookies from an already logged-in browser profile (`COOKIES_FROM_BROWSER=auto`, or e.g. `chrome:Default`). This only imports an existing session; it cannot create a Google login or manufacture valid cookies. Railway containers normally have no logged-in browser profile, so provide a fresh Netscape-format cookie export through Railway Variables when YouTube requires sign-in. Never commit or share cookie contents.
 
-The Docker image installs the Rust bgutil PO-token provider and its matching yt-dlp plugin. yt-dlp invokes the provider binary on demand; no second service is required, and cookies remain optional. PO tokens may help with some YouTube bot checks but do not guarantee access.
+The Docker image installs the Rust bgutil PO-token provider and its matching yt-dlp plugin. `main.py` starts the provider's HTTP server on `127.0.0.1:4416` in the same container, and yt-dlp requests tokens from it. No second Railway service is required, and cookies remain optional. PO tokens may help with some YouTube bot checks but do not guarantee access.
 
 YouTube cookies expire and may still be rejected from Railway, so they are not a durable fix. To let song searches fall back to Audius and SoundCloud instead, set `ENABLE_ALTERNATE_SOURCES=1` in Railway Variables and redeploy. These services have different catalogs and may not have every track. You can also set `ENABLE_YOUTUBE=0` to stop using YouTube entirely. There is no reliable way for the bot to refresh YouTube cookies automatically; that requires an interactive account login.
 
