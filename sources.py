@@ -167,8 +167,8 @@ def _match_score(query: str, title: str, artist: str = "") -> float:
     return score
 
 
-def _validate_cookie_domains(data: str) -> None:
-    """Reject cookie exports containing credentials for unrelated services."""
+def _validate_cookie_domains(data: str) -> int:
+    """Validate Netscape-format cookies and reject unrelated service credentials."""
     allowed = {
         "google.com", "www.google.com", "accounts.google.com", "ogs.google.com",
         "youtube.com", "www.youtube.com", "m.youtube.com",
@@ -176,9 +176,11 @@ def _validate_cookie_domains(data: str) -> None:
     found = 0
     for line_no, raw in enumerate(data.splitlines(), 1):
         line = raw.strip()
-        if not line or line.startswith("#") and not line.startswith("#HttpOnly_"):
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
             continue
-        fields = line.split("\\t")
+        # Netscape cookie files are tab-delimited. Splitting on the literal
+        # characters backslash+t rejects every otherwise-valid exported row.
+        fields = line.split("\t")
         if len(fields) != 7:
             raise ValueError(f"invalid Netscape cookie row at line {line_no}")
         domain = fields[0].removeprefix("#HttpOnly_").lstrip(".").lower()
@@ -187,6 +189,7 @@ def _validate_cookie_domains(data: str) -> None:
         found += 1
     if not found:
         raise ValueError("cookie export contains no supported Google/YouTube cookies")
+    return found
 
 
 def _prepare_cookies() -> str | None:
@@ -196,7 +199,8 @@ def _prepare_cookies() -> str | None:
         b64 = os.environ.get("COOKIES_BASE64", "").strip()
         txt = os.environ.get("COOKIES_TXT", "")
         if b64:
-            data = base64.b64decode(b64).decode("utf-8", "replace")
+            # Reject malformed Base64 instead of silently accepting a truncated export.
+            data = base64.b64decode(b64, validate=True).decode("utf-8")
         elif txt.strip():
             data = txt.replace("\\n", "\n")
         else:
@@ -205,9 +209,11 @@ def _prepare_cookies() -> str | None:
                 return None
             with open(src, "r", encoding="utf-8") as f:
                 data = f.read()
-        _validate_cookie_domains(data)
+        cookie_count = _validate_cookie_domains(data)
         with open(dst, "w", encoding="utf-8") as f:
             f.write(data)
+        source = "COOKIES_BASE64" if b64 else ("COOKIES_TXT" if txt.strip() else "cookies.txt")
+        log(f"loaded {cookie_count} validated cookie entries from {source}")
         return dst
     except Exception as e:
         log("cookies not loaded:", e)
