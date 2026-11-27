@@ -15,6 +15,8 @@ Env options (all optional):
   COOKIES_TXT / COOKIES_BASE64   optional YouTube cookies (default: cookies.txt next to this file)
   COOKIES_FROM_BROWSER           auto-detect an existing logged-in browser profile, or set chrome[:profile],firefox,etc.
   ENABLE_YOUTUBE                  set to 0 to disable YouTube (enabled by default)
+  YT_PROXY / YT_PROXIES           comma-separated HTTP proxies for YouTube; rotated on failure
+  YT_PROXY_COOLDOWN               seconds a failed proxy is skipped (default 300)
   RESOLVE_TIMEOUT   max seconds spent on one search (default 55)
 """
 from __future__ import annotations
@@ -45,9 +47,86 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like
 HTTP_TIMEOUT = 8
 DEADLINE = int(os.environ.get("RESOLVE_TIMEOUT", "55"))
 URL_RE = re.compile(r"^https?://", re.I)
-# Optional HTTP proxy (ideally residential) used ONLY for YouTube. YouTube stream
-# links are locked to the IP that resolved them, so playback must use it too.
-YT_PROXY = os.environ.get("YT_PROXY", "").strip() or None
+# Optional HTTP proxy list (ideally residential) used ONLY for YouTube. YouTube
+# stream links are locked to the IP that resolved them, so playback must use the
+# same proxy. Accepts a comma/newline separated list and rotates on failures.
+def _split_proxy_list(raw: str) -> list[str]:
+    return list(dict.fromkeys(p.strip() for p in re.split(r"[\s,;]+", raw or "") if p.strip()))
+
+
+class ProxyPool:
+    """Round-robin proxy list with per-proxy cooldowns."""
+
+    def __init__(self, proxies: list[str], cooldown: int = 300):
+        self._proxies = list(dict.fromkeys(proxies))
+        self._cooldown = cooldown
+        self._bad_until: dict[str, float] = {}
+        self._last_good: str | None = None
+        self._cursor = 0
+        self._lock = threading.Lock()
+
+    def __bool__(self) -> bool:
+        return bool(self._proxies)
+
+    def __len__(self) -> int:
+        return len(self._proxies)
+
+    @staticmethod
+    def label(proxy: str | None) -> str:
+        if not proxy:
+            return "direct"
+        try:
+            parsed = urllib.parse.urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+            return parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+        except Exception:
+            return "proxy"
+
+    def candidates(self) -> list[str | None]:
+        with self._lock:
+            now = time.time()
+            alive = [p for p in self._proxies if self._bad_until.get(p, 0) <= now]
+            if not alive:
+                return [None]
+            if self._last_good in alive:
+                alive.remove(self._last_good)
+                alive.insert(0, self._last_good)
+            if len(alive) > 1:
+                start = self._cursor % len(alive)
+                alive = alive[start:] + alive[:start]
+                self._cursor = (start + 1) % len(alive)
+            return alive
+
+    def mark_ok(self, proxy: str | None) -> None:
+        if not proxy:
+            return
+        with self._lock:
+            self._bad_until.pop(proxy, None)
+            self._last_good = proxy
+
+    def mark_bad(self, proxy: str | None, reason: str = "") -> None:
+        if not proxy:
+            return
+        with self._lock:
+            self._bad_until[proxy] = time.time() + self._cooldown
+        log(f"youtube proxy cooling down: {self.label(proxy)} ({reason[:80]})")
+
+    def all_bad(self) -> bool:
+        with self._lock:
+            now = time.time()
+            return bool(self._proxies) and all(
+                self._bad_until.get(p, 0) > now for p in self._proxies
+            )
+
+
+try:
+    _PROXY_COOLDOWN = int(os.environ.get("YT_PROXY_COOLDOWN", "300") or 300)
+except ValueError:
+    _PROXY_COOLDOWN = 300
+PROXY_POOL = ProxyPool(
+    _split_proxy_list(os.environ.get("YT_PROXY", "") + "," + os.environ.get("YT_PROXIES", "")),
+    _PROXY_COOLDOWN,
+)
+YT_PROXY = PROXY_POOL.candidates()[0] if PROXY_POOL else None
 # A YouTube URL can resolve successfully and still answer 403 to ffmpeg (IP-bound
 # or PO-token protected). Probe every stream before playback; otherwise the bot
 # only discovers the dead link after the stream has already started and stopped.
@@ -163,7 +242,7 @@ def _finish(info: dict, allow_low_quality: bool = False) -> dict:
             raise RuntimeError(f"{source}: only a muxed video format is available")
     verify = True
     if verify and not playable(info["url"], info.get("headers") or {},
-                               YT_PROXY if source == "youtube" else None):
+                               info.get("proxy")):
         raise RuntimeError(f"{source}: stream not reachable")
     return info
 
@@ -692,9 +771,8 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
               browser: tuple[str, str | None, None, None] | None = None,
               proxy: str | None = None) -> dict:
     o = {
-        "format": "bestaudio[acodec!=none]/best[acodec!=none]/best",
+        "format": "bestaudio[acodec=opus]/bestaudio[acodec!=none]/best[acodec!=none]/best",
         "format_sort": ["abr", "asr"],
-        "js_runtimes": {"deno": {}, "node": {}},
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -868,10 +946,24 @@ def _note_quality(attempt: dict, info: dict) -> None:
     except (TypeError, ValueError):
         rate = "bitrate unknown"
     log(f"youtube stream: {info.get('format_id') or '?'} {info.get('acodec') or '?'} "
-        f"{rate} {info.get('asr') or '?'} Hz")
+        f"{rate} {info.get('asr') or '?'} Hz via {ProxyPool.label(info.get('proxy'))}")
 
 
-def _yt_extract(url: str) -> dict:
+def _is_proxy_error(e: Exception) -> bool:
+    m = str(e).lower()
+    return any(token in m for token in (
+        "proxy", "tunnel", "407", "authentication required",
+        "connection reset", "connection refused", "connection aborted",
+        "timed out", "timeout", "stream not reachable", "403", "forbidden",
+        "remote end closed", "ssl", "certificate",
+    ))
+
+
+def _safe_error(e: Exception) -> str:
+    return re.sub(r"//[^/@\s]+@", "//***@", str(e))
+
+
+def _yt_extract_one(url: str, proxy: str | None) -> dict:
     """Resolve ONE video url to a stream, trying each client strategy in turn."""
     refresh_cookies()
     last: Exception | None = None
@@ -880,48 +972,98 @@ def _yt_extract(url: str) -> dict:
         used_cookies = bool(a.get("cookies", True) and COOKIES)
         try:
             entries = _ydl_entries(
-                _ydl_opts(a.get("cookies", True), a.get("clients"), a.get("browser"), YT_PROXY), url
+                _ydl_opts(a.get("cookies", True), a.get("clients"), a.get("browser"), proxy), url
             )
-            info = _finish(_norm(entries[0], "youtube"), allow_low_quality=allow_low)
+            info = _norm(entries[0], "youtube")
+            info["proxy"] = proxy
+            info = _finish(info, allow_low_quality=allow_low)
             _note_quality(a, info)
             return info
         except NotFound as e:
             last = e
         except Exception as e:
             last = e
-            log("youtube attempt failed:", str(e)[:160])
+            log("youtube attempt failed:", _safe_error(e)[:160])
             if _is_unavailable(e):
                 break
             if used_cookies and (_is_bot_check(e) or _is_cookie_error(e)):
                 # Same client, but without the possibly expired cookies.
                 try:
                     entries = _ydl_entries(
-                        _ydl_opts(cookies=False, clients=a.get("clients"), proxy=YT_PROXY), url
+                        _ydl_opts(cookies=False, clients=a.get("clients"), proxy=proxy), url
                     )
-                    info = _finish(_norm(entries[0], "youtube"), allow_low_quality=allow_low)
+                    info = _norm(entries[0], "youtube")
+                    info["proxy"] = proxy
+                    info = _finish(info, allow_low_quality=allow_low)
                     _note_quality(a, info)
                     return info
                 except Exception as retry_error:
                     last = retry_error
-                    log("youtube retry without cookies failed:", str(retry_error)[:160])
+                    log("youtube retry without cookies failed:", _safe_error(retry_error)[:160])
                     if _is_unavailable(retry_error):
                         break
     raise last or RuntimeError("youtube failed")
 
 
+def _yt_extract(url: str) -> dict:
+    """Try the configured proxy pool, cooling down each failed proxy."""
+    last: Exception | None = None
+    for proxy in PROXY_POOL.candidates():
+        try:
+            info = _yt_extract_one(url, proxy)
+            PROXY_POOL.mark_ok(proxy)
+            return info
+        except Exception as e:
+            last = e
+            if proxy and _is_proxy_error(e):
+                PROXY_POOL.mark_bad(proxy, _safe_error(e))
+                continue
+            if _is_bot_check(e) or _is_unavailable(e):
+                if _is_unavailable(e):
+                    raise
+                if proxy:
+                    continue
+                raise
+            if proxy:
+                continue
+            raise
+    if PROXY_POOL.all_bad():
+        log("all youtube proxies are cooling down; trying direct")
+    raise last or RuntimeError("youtube failed")
+
+
 def _search_entries(target: str) -> list[dict]:
     """Flat search first (fast, no player request), then once with cookies if blocked."""
-    opts = _ydl_opts(cookies=False, proxy=YT_PROXY)
-    opts["extract_flat"] = True
-    try:
-        return _ydl_entries(opts, target)
-    except Exception as e:
-        if not COOKIES:
-            raise
-        log("youtube search failed without cookies, retrying with cookies:", str(e)[:120])
-        retry = _ydl_opts(cookies=True, proxy=YT_PROXY)
-        retry["extract_flat"] = True
-        return _ydl_entries(retry, target)
+    last: Exception | None = None
+    for proxy in PROXY_POOL.candidates():
+        opts = _ydl_opts(cookies=False, proxy=proxy)
+        opts["extract_flat"] = True
+        try:
+            return _ydl_entries(opts, target)
+        except Exception as e:
+            last = e
+            if proxy and _is_proxy_error(e):
+                PROXY_POOL.mark_bad(proxy, _safe_error(e))
+                continue
+            if not COOKIES:
+                if proxy:
+                    continue
+                raise
+            log("youtube search failed without cookies, retrying with cookies:",
+                _safe_error(e)[:120])
+            retry = _ydl_opts(cookies=True, proxy=proxy)
+            retry["extract_flat"] = True
+            try:
+                return _ydl_entries(retry, target)
+            except Exception as retry_error:
+                last = retry_error
+                if proxy and _is_proxy_error(retry_error):
+                    PROXY_POOL.mark_bad(proxy, _safe_error(retry_error))
+                    continue
+                if proxy:
+                    continue
+                raise
+    raise last or RuntimeError("youtube search failed")
 
 
 _OEMBED_CACHE: dict[str, str] = {}

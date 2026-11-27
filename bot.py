@@ -103,6 +103,7 @@ class Track:
     start_token: int = 0
     last_start_at: float = 0.0
     last_start_url: str = ""
+    proxy: str = ""
 
 
 queues: dict[int, list[Track]] = {}
@@ -132,6 +133,7 @@ async def reresolve(t: Track):
     """Find the song again (skipping sources that already failed for it) and update the track."""
     info = await asyncio.to_thread(sources.resolve, t.query or t.title, t.bad)
     t.url, t.headers, t.source = info["url"], info.get("headers") or {}, info["source"]
+    t.proxy = info.get("proxy") or ""
     t.page = info.get("page") or t.page
     t.duration = info.get("duration") or t.duration
     t.thumbs = info.get("thumbnails") or t.thumbs
@@ -358,9 +360,13 @@ async def start_stream(chat_id: int, t: Track, seek_to: int | None = None):
     # is 96 kHz and forces an extra resample; on a small Railway container that
     # causes underruns (crackling) without any audible benefit.
     start = ["--audio", "---start"]
-    if t.source == "youtube" and sources.YT_PROXY:
+    proxy = t.proxy
+    if t.source == "youtube" and not proxy and sources.PROXY_POOL:
+        # Old queued tracks have no stored proxy; use the next available one.
+        proxy = sources.PROXY_POOL.candidates()[0] or ""
+    if proxy:
         # The stream link is bound to the proxy's IP, so ffmpeg must fetch it through it too.
-        start += ["-http_proxy", sources.YT_PROXY]
+        start += ["-http_proxy", proxy]
     if seek_to is not None:
         start += ["-ss", str(seek_to)]
     if t.ffmpeg_parameters:
@@ -881,6 +887,7 @@ async def play_query(m: Message, force: bool = False):
         artist=info.get("artist") or "",
         headers=info.get("headers") or {},
         source=info.get("source", ""),
+        proxy=info.get("proxy") or "",
         query=query,
         resolved_at=time.time(),
         thumbs=info.get("thumbnails") or [],

@@ -85,6 +85,32 @@ class SourceOrderTests(unittest.TestCase):
         self.assertEqual(names, ["youtube"])
 
 
+class ProxyPoolTests(unittest.TestCase):
+    def test_rotates_and_cools_bad_proxies(self):
+        pool = sources.ProxyPool(["http://a:1", "http://b:2"], cooldown=60)
+
+        self.assertEqual(pool.candidates(), ["http://a:1", "http://b:2"])
+        pool.mark_bad("http://a:1", "407")
+        self.assertEqual(pool.candidates(), ["http://b:2"])
+        pool.mark_bad("http://b:2", "407")
+
+        self.assertEqual(pool.candidates(), [None])
+        self.assertTrue(pool.all_bad())
+
+    def test_splits_comma_and_newline_separated_list(self):
+        raw = "http://a:1, http://b:2\nhttp://c:3;http://a:1"
+        self.assertEqual(
+            sources._split_proxy_list(raw),
+            ["http://a:1", "http://b:2", "http://c:3"],
+        )
+
+    def test_label_does_not_expose_credentials(self):
+        self.assertEqual(
+            sources.ProxyPool.label("http://user:pass@1.2.3.4:8080"),
+            "1.2.3.4:8080",
+        )
+
+
 class YoutubePotTests(unittest.TestCase):
     def test_ydl_opts_uses_cookie_compatible_clients_with_http_provider(self):
         opts = sources._ydl_opts()

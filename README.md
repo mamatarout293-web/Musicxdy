@@ -112,7 +112,12 @@ help with some YouTube bot checks but do not guarantee access.
 
 On Railway, YouTube sometimes blocks datacenter IPs even with valid cookies. If that happens:
 - use `COOKIES_URL` so the bot can refresh cookies without a redeploy, and/or
-- set `YT_PROXY` to a residential proxy (stream links are then fetched through the same proxy), and/or
+- set `YT_PROXY` to a comma-separated residential proxy list. The bot rotates through the list;
+  a proxy that returns 403/407/timeout is skipped for `YT_PROXY_COOLDOWN` seconds (default 300)
+  and the next one is tried. Playback uses the same proxy that resolved the stream. When every
+  proxy is cooling down the bot logs `all youtube proxies are cooling down`, tries a direct
+  connection, and then falls back to alternate sources if they are enabled. Replace the list in
+  Railway when the proxies expire; no code change is needed.
 - set `ENABLE_ALTERNATE_SOURCES=1` to let searches fall back to Audius and SoundCloud.
 
 These services have different catalogs and may not have every track. You can also set
