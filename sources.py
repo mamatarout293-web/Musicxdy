@@ -112,6 +112,12 @@ class ProxyPool:
             self._bad_until.pop(proxy, None)
             self._last_good = proxy
 
+    def is_bad(self, proxy: str | None) -> bool:
+        if not proxy:
+            return False
+        with self._lock:
+            return self._bad_until.get(proxy, 0) > time.time()
+
     def mark_bad(self, proxy: str | None, reason: str = "") -> None:
         if not proxy:
             return
@@ -1116,10 +1122,12 @@ def _enrich_channels(entries: list[dict]) -> None:
             e["channel"] = author
 
 
-def _youtube(target: str) -> dict:
-    cached = _YT_CACHE.get(target)
+def _youtube(target: str, fresh: bool = False) -> dict:
+    cached = None if fresh else _YT_CACHE.get(target)
     if cached and time.time() - cached[0] < _YT_CACHE_TTL:
-        return cached[1]
+        cached_proxy = cached[1].get("proxy")
+        if not (cached_proxy and PROXY_POOL.is_bad(cached_proxy)):
+            return cached[1]
     refresh_cookies()
     if not COOKIES and not _browser_cookie_specs():
         log("no YouTube cookies loaded; using cookie-less clients "

@@ -506,8 +506,8 @@ async def watch_start(chat_id: int, t: Track, token: int):
 
 
 async def start_with_fallback(chat_id: int, t: Track):
-    """Start this exact requested track; on media failure, retry other providers only."""
-    attempts = max(1, len(sources.SOURCES))
+    """Start this exact requested track; retry YouTube with another proxy, then other providers."""
+    attempts = max(1, len(sources.SOURCES) + 1)
     last_error: Exception | None = None
     for attempt in range(attempts):
         try:
@@ -522,7 +522,13 @@ async def start_with_fallback(chat_id: int, t: Track):
             if _is_call_setup_error(e):
                 raise
             last_error = e
-            if t.source:
+            retry_with_new_proxy = False
+            if t.source == "youtube" and t.proxy:
+                sources.PROXY_POOL.mark_bad(t.proxy, str(e))
+                if not sources.PROXY_POOL.all_bad():
+                    retry_with_new_proxy = True
+                    t.bad.discard("youtube")
+            if not retry_with_new_proxy and t.source:
                 t.bad.add(t.source)
             if attempt + 1 >= attempts:
                 break
