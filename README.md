@@ -21,6 +21,7 @@ ENABLE_ALTERNATE_SOURCES=1 (optional; allows Audius/SoundCloud fallback)
 MIN_AUDIO_KBPS=120 (optional; reject lower-bitrate formats)
 VERIFY_YOUTUBE=0 (optional; keep 0, YouTube URLs are IP-bound)
 AUDIO_QUALITY=high (optional; high = 48 kHz stereo, medium = 36 kHz mono fallback)
+AUDIO_NORMALIZE=1 (optional; EBU R128 loudness normalization, 0 to disable)
 ```
 3. Railway redeploys. Open **Deployments → View logs**; you should see `starting bot.py`.
 
@@ -45,10 +46,17 @@ Cookie handling is resilient:
 Audio quality and start speed:
 - Playback uses 48 kHz stereo, which is what Telegram voice chats use. The old 96 kHz
   "studio" mode caused resampling underruns (crackling) on small containers.
+- `AUDIO_NORMALIZE=1` (default) applies EBU R128 loudness normalization, so one song is not
+  much quieter/louder than the next and peaks do not clip. Set `0` to disable.
 - Search is typo-tolerant (for example, `believr` still finds `Believer`).
-- Official artist / Topic / VEVO uploads rank first. Remixes, TikTok edits, slowed/reverb,
-  sped-up, covers, live, 8D, karaoke and similar variants are skipped unless you type that
-  keyword yourself. A lyrics upload is used only when no official upload is available.
+- Official uploads are detected from verified channels, known labels (T-Series, Sony Music,
+  Zee Music, Tips, YRF, Saregama, etc.), Topic/VEVO, and the artist's own channel. A title that
+  merely says "official" is not trusted, because re-uploads use that word too.
+- Among official uploads, the popular version wins (view count), so a random re-upload cannot
+  outrank the real song.
+- Remixes, TikTok edits, slowed/reverb, sped-up, covers, live, 8D, karaoke and similar variants
+  are skipped unless you type that keyword yourself. Lyrics uploads are used only when no
+  official upload is available; arbitrary covers are never used as a fallback.
 - Audio-only formats are preferred (`bestaudio`, sorted by bitrate/sample rate); YouTube's muxed
   360p format 18 is accepted only as a last resort.
 - `MIN_AUDIO_KBPS` (default 120) rejects clearly low-bitrate streams before they are played.
@@ -57,6 +65,7 @@ Audio quality and start speed:
 - `VERIFY_YOUTUBE=0` (default) skips the extra stream probe. YouTube URLs are bound to the IP that
   resolved them, so probing them separately can fail and force a slow, low-quality fallback. Set
   `VERIFY_YOUTUBE=1` only if you need dead-link detection before playback.
+- The log line `youtube pick:` shows which title/channel/view count was actually selected.
 
 It can also try importing cookies from an already logged-in browser profile
 (`COOKIES_FROM_BROWSER=auto`, or e.g. `chrome:Default`). This only imports an existing session; it

@@ -391,16 +391,49 @@ class SearchMatchingTests(unittest.TestCase):
         self.assertFalse(sources._variant_unwanted(
             "believer", title, "7clouds", allow_soft=True))
 
+    def test_lyrics_query_still_rejects_remix(self):
+        self.assertTrue(sources._variant_unwanted(
+            "believer lyrics", "Believer (TikTok Remix)", ""))
+        self.assertFalse(sources._variant_unwanted(
+            "believer lyrics", "Believer (Lyrics)", ""))
+        self.assertFalse(sources._variant_unwanted(
+            "believer remix", "Believer (Remix)", ""))
+
     def test_official_upload_is_detected(self):
         self.assertTrue(sources._is_official(
             "Imagine Dragons - Believer (Official Music Video)",
             "ImagineDragons", "believer imagine dragons"))
         self.assertTrue(sources._is_official(
             "Believer", "Imagine Dragons - Topic", "believer"))
+        self.assertTrue(sources._is_official(
+            "Tum Hi Ho", "T-Series", "tum hi ho", verified=True))
+        self.assertTrue(sources._is_official(
+            "Tum Hi Ho", "T-Series", "tum hi ho"))
+        self.assertTrue(sources._is_official(
+            "Kesariya", "Sony Music India", "kesariya"))
+        self.assertFalse(sources._is_official(
+            "Apna Bana Le", "Mudit-Pancham", "apna bana le",
+            verified=True, views=660_000))
+        self.assertTrue(sources._is_official(
+            "Apna Bana Le", "Mudit-Pancham", "apna bana le",
+            verified=True, views=20_000_000))
         self.assertFalse(sources._is_official(
             "Believer (Lyrics)", "7clouds", "believer imagine dragons"))
         self.assertFalse(sources._is_official(
             "Believer", "Imagine Dragons Spain", "believer imagine dragons"))
+        # A title that merely claims "official" is not an official channel.
+        self.assertFalse(sources._is_official(
+            "Tum Hi Ho (Official Video)", "Random Channel", "tum hi ho"))
+
+    def test_popular_official_beats_obscure_same_title(self):
+        q = "apna bana le"
+        zee = sources._match_score(
+            q, "Apna Bana Le - Full Audio | Bhediya", "Zee Music Company",
+            273, True, 128_000_000)
+        obscure = sources._match_score(
+            q, "Apna Bana Le | Official Song Visualiser", "Mudit-Pancham",
+            187, True, 660_000)
+        self.assertGreater(zee, obscure)
 
     def test_official_scores_above_lyrics_and_remix(self):
         q = "believer imagine dragons"
@@ -424,6 +457,24 @@ class SearchMatchingTests(unittest.TestCase):
     def test_candidate_filter_rejects_remix_even_when_relaxed(self):
         entry = {"title": "Believer (TikTok Remix)", "channel": "edits", "duration": 200}
         self.assertFalse(sources._candidate_ok("believer", entry, 0.5, allow_soft=True))
+
+    def test_candidate_filter_rejects_live_streams(self):
+        entry = {"title": "Believer", "channel": "ImagineDragons", "duration": 200,
+                 "live_status": "is_live"}
+        self.assertFalse(sources._candidate_ok("believer", entry))
+
+    def test_candidate_filter_rejects_near_zero_views(self):
+        entry = {"title": "Believer", "channel": "ImagineDragons", "duration": 200,
+                 "view_count": 5}
+        self.assertFalse(sources._candidate_ok("believer", entry))
+        entry["view_count"] = 100_000
+        self.assertTrue(sources._candidate_ok("believer", entry))
+
+    def test_oembed_channel_enrichment(self):
+        entries = [{"id": "abc", "title": "Song"}]
+        with patch.object(sources, "_oembed_author", return_value="T-Series"):
+            sources._enrich_channels(entries)
+        self.assertEqual(entries[0]["channel"], "T-Series")
 
 
 class YoutubeUnavailableTests(unittest.TestCase):

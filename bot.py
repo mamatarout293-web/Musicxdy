@@ -276,6 +276,10 @@ async def start_stream(chat_id: int, t: Track, seek_to: int | None = None):
     if t.ffmpeg_parameters:
         start.append(t.ffmpeg_parameters)
     ffmpeg_parameters = " ".join(start)
+    if os.environ.get("AUDIO_NORMALIZE", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        # Single-pass EBU R128 evens out loud/quiet uploads and prevents clipping.
+        # ffprobe does not support -af; pytgcalls strips unsupported flags for its probe.
+        ffmpeg_parameters += " ---end -af loudnorm=I=-16:TP=-1.5:LRA=11"
     kw = dict(
         audio_parameters=AUDIO_QUALITY,  # default 48 kHz stereo, matches Telegram
         video_flags=MediaStream.Flags.IGNORE,

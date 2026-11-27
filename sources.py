@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -217,49 +218,65 @@ _OFFICIAL_TITLE = re.compile(
     r"\b(?:official\s*(?:music\s*)?(?:video|audio|visuali[sz]er)|"
     r"official\s+(?:lyric|lyrics)\s*video|official)\b", re.I
 )
-
-
-def _query_allows_variant(query: str) -> bool:
-    """A user who explicitly typed 'remix'/'lyrics' is asking for that version."""
-    return bool(_VARIANT_HARD.search(query) or _VARIANT_SOFT.search(query))
+# Verified is the strongest signal, but it is not always present in flat search
+# results. These are the channels that publish the real masters.
+_LABEL_CHANNEL = re.compile(
+    r"\b(?:t[- ]?series|sony music|zee music|tips|yrf|yash raj|saregama|"
+    r"ishtar|speed records|white hill|desi music|saga music|times music|"
+    r"ultra|wave music|srg|venus|eros|shemaroo|rajshri|aditya music|"
+    r"lahari|think music|junglee|warner music|universal music|atlantic|"
+    r"columbia|rca|capitol|interscope|republic|island|def jam|empire|"
+    r"300 entertainment|vevo|topic)\b", re.I
+)
 
 
 def _variant_unwanted(query: str, title: str, artist: str = "",
                       allow_soft: bool = False) -> bool:
     """Reject alternate edits named in either the title or the publishing channel."""
-    if _query_allows_variant(query):
-        return False
     text = f"{title} {artist}"
-    if _VARIANT_HARD.search(text):
+    if _VARIANT_HARD.search(text) and not _VARIANT_HARD.search(query):
         return True
     if _VARIANT_SOFT.search(text):
         # An official lyric video is still an official upload.
-        return not (allow_soft or _OFFICIAL_TITLE.search(title or ""))
+        return not (allow_soft or _VARIANT_SOFT.search(query)
+                    or _OFFICIAL_TITLE.search(title or ""))
     return False
 
 
-def _is_official(title: str, channel: str, query: str = "") -> bool:
-    """Best-effort detection of the artist's own upload or auto-generated Topic audio."""
+def _is_official(title: str, channel: str, query: str = "",
+                 verified: bool = False, views: int = 0) -> bool:
+    """Trust only platform-verified channels, known labels, Topic/VEVO, or the artist's own channel.
+
+    A title that merely says "official" is not enough: re-uploads use that word too.
+    A verified channel is not enough either when the query names an artist: verified
+    cover artists upload the same title. Known labels, the artist's own channel, or
+    a clearly popular upload are accepted instead.
+    """
     ch = (channel or "").lower()
-    title = title or ""
-    if "topic" in ch or "vevo" in ch:
-        return True
-    if _OFFICIAL_TITLE.search(title):
-        return True
     q = _tokens(query)
     channel_tokens = _channel_tokens(channel)
+    artist_match = False
     if len(q) >= 2 and 2 <= len(channel_tokens) <= 4:
         matched = sum(
             1 for ct in channel_tokens
             if any(_token_match(qt, ct) >= 0.8 for qt in q)
         )
-        if matched == len(channel_tokens):
-            return True
-    return False
+        artist_match = matched == len(channel_tokens)
+    try:
+        views = int(views or 0)
+    except (TypeError, ValueError):
+        views = 0
+    if verified:
+        return (artist_match or len(q) < 3
+                or bool(_LABEL_CHANNEL.search(ch)) or views >= 10_000_000)
+    if _LABEL_CHANNEL.search(ch):
+        return True
+    return artist_match
 
 
 def _match_score(query: str, title: str, artist: str = "",
-                 duration: float = 0, verified: bool = False) -> float:
+                 duration: float = 0, verified: bool = False,
+                 views: int = 0) -> float:
     q = _tokens(query)
     t = _tokens(title)
     a = _tokens(artist)
@@ -269,15 +286,20 @@ def _match_score(query: str, title: str, artist: str = "",
         duration = float(duration or 0)
     except (TypeError, ValueError):
         duration = 0.0
+    try:
+        views = int(views or 0)
+    except (TypeError, ValueError):
+        views = 0
     overlap = _coverage(q, t | a)
     title_overlap = _coverage(q, t)
     score = overlap * 5 + title_overlap * 2
-    if q == t:
-        score += 5
-    if _is_official(title, artist, query):
-        score += 6
     if verified:
-        score += 1.5
+        score += 6
+    if _is_official(title, artist, query, verified, views):
+        score += 4
+    if views:
+        # Popular uploads are usually the real song; cap so it cannot hide official signals.
+        score += min(14.0, math.log10(views) * 1.8)
     if duration:
         if duration < 90 or duration > 900:
             score -= 4
@@ -293,6 +315,15 @@ def _candidate_ok(query: str, entry: dict, min_coverage: float = 0.7,
     title = entry.get("title") or ""
     artist = entry.get("artist") or entry.get("uploader") or entry.get("channel") or ""
     if _variant_unwanted(query, title, artist, allow_soft=allow_soft):
+        return False
+    if entry.get("live_status") in {"is_live", "is_upcoming"}:
+        return False
+    try:
+        views = int(entry.get("view_count") or 0)
+    except (TypeError, ValueError):
+        views = 0
+    # A handful of views is almost always a fresh re-upload, not the real song.
+    if 0 < views < 1000:
         return False
     try:
         duration = float(entry.get("duration") or 0)
@@ -743,6 +774,47 @@ def _search_entries(target: str) -> list[dict]:
         return _ydl_entries(retry, target)
 
 
+_OEMBED_CACHE: dict[str, str] = {}
+_OEMBED_LOCK = threading.Lock()
+
+
+def _oembed_author(vid: str) -> str:
+    """Channel name for a video id, without a player request."""
+    if not vid:
+        return ""
+    with _OEMBED_LOCK:
+        if vid in _OEMBED_CACHE:
+            return _OEMBED_CACHE[vid]
+    author = ""
+    url = ("https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v="
+           f"{urllib.parse.quote(vid)}&format=json")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+            author = (data.get("author_name") or "").strip()
+    except Exception:
+        author = ""
+    with _OEMBED_LOCK:
+        _OEMBED_CACHE[vid] = author
+    return author
+
+
+def _enrich_channels(entries: list[dict]) -> None:
+    """Flat search sometimes drops the channel; fill it so official detection still works."""
+    missing = [
+        e for e in entries
+        if e.get("id") and not (e.get("channel") or e.get("uploader") or e.get("artist"))
+    ][:20]
+    if not missing:
+        return
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        authors = list(pool.map(_oembed_author, [e["id"] for e in missing]))
+    for e, author in zip(missing, authors):
+        if author:
+            e["channel"] = author
+
+
 def _youtube(target: str) -> dict:
     cached = _YT_CACHE.get(target)
     if cached and time.time() - cached[0] < _YT_CACHE_TTL:
@@ -759,42 +831,65 @@ def _youtube(target: str) -> dict:
         return info
 
     # Search is a cheap flat listing: it needs no player request, so it is fast.
-    # Only the chosen candidates go through full stream extraction (previously all 10 did).
+    # The official-biased search runs in parallel with the plain one, so it does not
+    # add latency. Only the chosen candidates go through full stream extraction.
     search_query = m.group(1).strip()
-    entries = _search_entries(target)
 
     def channel_of(e):
         return e.get("channel") or e.get("uploader") or e.get("artist") or ""
 
-    # If the first page has no official upload, search once more with an
-    # official-audio bias. This is a cheap flat search, not a player request.
-    if not any(_is_official(e.get("title", ""), channel_of(e), search_query) for e in entries):
-        try:
-            extra = _search_entries(f"ytsearch10:{search_query} official audio")
-            seen = {e.get("id") for e in entries if e.get("id")}
-            entries += [e for e in extra if e.get("id") not in seen]
-        except Exception as e:
-            log("official search fallback failed:", str(e)[:100])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        plain_future = pool.submit(_search_entries, target)
+        official_future = None
+        if "official" not in search_query.lower():
+            official_future = pool.submit(
+                _search_entries, f"ytsearch10:{search_query} official audio"
+            )
+        entries = plain_future.result()
+        if official_future is not None:
+            try:
+                extra = official_future.result()
+            except Exception as e:
+                log("official search failed:", str(e)[:100])
+            else:
+                seen = {e.get("id") for e in entries if e.get("id")}
+                entries += [e for e in extra if e.get("id") not in seen]
+
+    _enrich_channels(entries)
+    for i, e in enumerate(entries):
+        e["_rank"] = i
 
     def score(e):
         return _match_score(
             search_query, e.get("title", ""), channel_of(e),
             e.get("duration") or 0, bool(e.get("channel_is_verified")),
+            e.get("view_count") or 0,
+        ) + max(0.0, 3.0 - (e.get("_rank") or 0) * 0.2)
+
+    def is_official(e):
+        return _is_official(
+            e.get("title", ""), channel_of(e), search_query,
+            bool(e.get("channel_is_verified")), e.get("view_count") or 0,
         )
 
     ranked = sorted(entries, key=score, reverse=True)
-    strict = [e for e in ranked if _candidate_ok(search_query, e, 0.7)]
-    relaxed = [e for e in ranked if _candidate_ok(search_query, e, 0.5, allow_soft=True)]
+    official_candidates = [
+        e for e in ranked if is_official(e) and _candidate_ok(search_query, e, 0.7)
+    ]
+    # Lyrics uploads usually reuse the official audio; never fall back to arbitrary covers.
+    lyrics_candidates = [
+        e for e in ranked
+        if _VARIANT_SOFT.search(e.get("title", "") or "")
+        and _candidate_ok(search_query, e, 0.5, allow_soft=True)
+    ]
     candidates: list[dict] = []
-    for e in strict[:3] + relaxed:
+    for e in official_candidates[:4] + lyrics_candidates[:2]:
         if e not in candidates:
             candidates.append(e)
-        if len(candidates) >= 5:
-            break
     if not candidates:
-        raise NotFound("youtube: no acceptable search result")
-    if not strict:
-        log("youtube: no official upload found, using a lyrics upload")
+        raise NotFound("youtube: no official upload found")
+    if not official_candidates:
+        log("youtube: no official upload found, trying lyrics uploads")
     last: Exception | None = None
     for e in candidates:
         vid = e.get("id")
@@ -806,6 +901,7 @@ def _youtube(target: str) -> dict:
             if _is_bot_check(err):
                 raise  # same block applies to every candidate; fail fast
             continue
+        log("youtube pick:", f"{e.get('title', '')[:70]} | {channel_of(e)} | {e.get('view_count') or 0} views")
         _YT_CACHE[target] = (time.time(), info)
         return info
     raise last or NotFound("youtube: no playable result")
