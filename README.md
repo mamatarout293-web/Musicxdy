@@ -83,6 +83,8 @@ Now-playing card:
 - Buttons are colour-coded by row: green for Prev/Pause, blue for Skip/Shuffle, red for Loop/Stop.
 - After playback ends, completes or is stopped, the buttons are removed and only the photo plus the
   final status text remain.
+- Every player button and control command also posts a short English attribution message tagging
+  the user who pressed it, for example `👤 @name skipped the song.` or `👤 @name turned loop on.`
 - Title and requester are clipped to one line each, so long names cannot push the card out of shape.
 - If a lyrics upload is the only fallback, the card still uses the official song's artwork.
 - If Telegram cannot fetch a photo, the bot falls back to the same compact text card.

@@ -937,6 +937,8 @@ def _cmd(name: str, action: str):
             print(f"/{name} failed:", repr(e)[:200], flush=True)
             text = "Something went wrong."
         await m.reply_text(text)
+        if m.from_user:
+            await action_notice(m.chat.id, m.from_user, action, text)
 
 
 for _n, _a in (("mxpause", "pause"), ("mxresume", "resume"), ("mxskip", "skip"),
@@ -945,13 +947,81 @@ for _n, _a in (("mxpause", "pause"), ("mxresume", "resume"), ("mxskip", "skip"),
     _cmd(_n, _a)
 
 
+_ACTION_DONE = {
+    "pause": "paused the song",
+    "resume": "resumed the song",
+    "skip": "skipped the song",
+    "prev": "went back to the previous song",
+    "shuffle": "shuffled the queue",
+    "stop": "stopped the playback",
+}
+_ACTION_TRIED = {
+    "pause": "tried to pause the song",
+    "resume": "tried to resume the song",
+    "skip": "tried to skip the song",
+    "prev": "tried to go back to the previous song",
+    "shuffle": "tried to shuffle the queue",
+    "stop": "tried to stop the playback",
+}
+_NOOP_RESULTS = {
+    "Nothing is playing.",
+    "Already paused.",
+    "Already playing.",
+    "No previous song.",
+    "Not enough songs in the queue.",
+    "Something went wrong.",
+}
+
+
+def _mention(user) -> str:
+    if not user:
+        return "Someone"
+    name = html.escape(user.first_name or user.username or "User")
+    if user.username:
+        return f"@{user.username}"
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
+
+
+def _action_phrase(action: str, result: str) -> str:
+    if action == "loop":
+        if "Loop on" in result:
+            return "turned loop on"
+        if "Loop off" in result:
+            return "turned loop off"
+        return "tried to toggle loop"
+    done = _ACTION_DONE.get(action)
+    if not done:
+        return "used the player controls"
+    if result in _NOOP_RESULTS:
+        return _ACTION_TRIED.get(action, done)
+    return done
+
+
+async def action_notice(chat_id: int, user, action: str, result: str):
+    """Post a separate English attribution line under the card for every button press."""
+    try:
+        await api("sendMessage", {
+            "chat_id": chat_id,
+            "text": f"{pe('user', True)} {_mention(user)} {_action_phrase(action, result)}.",
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        })
+    except Exception as e:
+        print("action notice failed:", repr(e)[:140], flush=True)
+
+
 @bot.on_callback_query(filters.regex(r"^ctl:"))
 async def buttons(_, cq: CallbackQuery):
+    action = cq.data.split(":", 1)[1]
     try:
-        text = await act(cq.message.chat.id, cq.data.split(":", 1)[1])
+        text = await act(cq.message.chat.id, action)
     except Exception:
         text = "Something went wrong."
-    await cq.answer(text)
+    try:
+        await cq.answer(text)
+    except Exception:
+        pass
+    await action_notice(cq.message.chat.id, cq.from_user, action, text)
 
 
 @bot.on_message(filters.command("mxqueue") & filters.group)
