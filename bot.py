@@ -461,7 +461,7 @@ async def watch_start(chat_id: int, t: Track, token: int):
                 retry = True
     if retry:
         try:
-            await play_next(chat_id, force=True)
+            await play_next(chat_id, force=True, expected=t)
         except Exception as e:
             print("advance after idle failed:", repr(e)[:160], flush=True)
 
@@ -586,11 +586,13 @@ async def leave(chat_id: int):
         pass
 
 
-async def play_next(chat_id: int, force: bool = False):
+async def play_next(chat_id: int, force: bool = False, expected: Track | None = None):
     """Advance the queue. A track that can't be played is skipped - the queue never gets stuck."""
     lock = advance_locks.setdefault(chat_id, asyncio.Lock())
     async with lock:
         q = queues.get(chat_id, [])
+        if expected is not None and (not q or q[0] is not expected):
+            return
         if q and loop.get(chat_id) and not force:
             t = q[0]
             t.end_state = ""
@@ -682,7 +684,7 @@ async def handle_end(chat_id: int):
             return
         except Exception as e:
             print("no other source worked:", repr(e)[:200], flush=True)
-    await play_next(chat_id, force=quick)
+    await play_next(chat_id, force=quick, expected=t)
 
 
 async def act(chat_id: int, action: str) -> str:
