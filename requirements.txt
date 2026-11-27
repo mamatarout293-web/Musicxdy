@@ -3,4 +3,4 @@ py-tgcalls==3.0.1
 ntgcalls==3.0.7
 tgcrypto==1.2.5
 yt-dlp[default]
-bgutil-ytdlp-pot-provider==2.0.2
+# The Rust-compatible bgutil yt-dlp plugin is installed from its GitHub release in Dockerfile.

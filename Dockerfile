@@ -1,27 +1,25 @@
-# Build the BgUtils PO Token provider script used by yt-dlp on headless servers.
-FROM node:22-bookworm-slim AS pot-provider
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git python3 make g++ libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev \
- && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 --branch 2.0.2 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil-ytdlp-pot-provider \
- && cd /opt/bgutil-ytdlp-pot-provider/server \
- && npm ci \
- && npx tsc
-
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# ffmpeg decodes audio for voice chat; native libraries support the PO token provider.
+# ffmpeg decodes audio for voice chat; Node supports yt-dlp's YouTube challenge solver.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg gcc libc6-dev ca-certificates libstdc++6 libcairo2 libpango-1.0-0 libjpeg62-turbo libgif7 librsvg2-2 \
+ && apt-get install -y --no-install-recommends ffmpeg gcc libc6-dev ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
-# Node 22 is used by yt-dlp EJS and the BgUtils token provider.
+# Install the Rust POT provider and its matching yt-dlp plugin. The plugin invokes
+# bgutil-pot on demand; no provider server is started.
+RUN curl -fsSL https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/latest/download/bgutil-pot-linux-x86_64 \
+        -o /usr/local/bin/bgutil-pot \
+ && chmod +x /usr/local/bin/bgutil-pot \
+ && curl -fsSL https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/latest/download/bgutil-ytdlp-pot-provider-rs.zip \
+        -o /tmp/bgutil-ytdlp-pot-provider-rs.zip \
+ && python -c "import site, zipfile; zipfile.ZipFile('/tmp/bgutil-ytdlp-pot-provider-rs.zip').extractall(site.getsitepackages()[0])" \
+ && rm /tmp/bgutil-ytdlp-pot-provider-rs.zip
+
 COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
-COPY --from=pot-provider /opt/bgutil-ytdlp-pot-provider/server /root/bgutil-ytdlp-pot-provider/server
 RUN node --version
 
 WORKDIR /app

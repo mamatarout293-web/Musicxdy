@@ -21,6 +21,8 @@ COOKIES_FROM_BROWSER=auto (optional; imports an existing browser profile when av
 
 YouTube authentication is deployment-dependent. The resolver reads `COOKIES_BASE64`, `COOKIES_TXT`, or a local `cookies.txt`. It can also try importing cookies from an already logged-in browser profile (`COOKIES_FROM_BROWSER=auto`, or e.g. `chrome:Default`). This only imports an existing session; it cannot create a Google login or manufacture valid cookies. Railway containers normally have no logged-in browser profile, so provide a fresh Netscape-format cookie export through Railway Variables when YouTube requires sign-in. Never commit or share cookie contents.
 
+The Docker image installs the Rust bgutil PO-token provider and its matching yt-dlp plugin. yt-dlp invokes the provider binary on demand; no second service is required, and cookies remain optional. PO tokens may help with some YouTube bot checks but do not guarantee access.
+
 Variables set in Railway always win over a local `.env`.
 
 ## Run locally
