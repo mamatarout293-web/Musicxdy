@@ -257,6 +257,9 @@ async def updater(t: Track):
 
 async def start_stream(chat_id: int, t: Track, seek_to: int | None = None):
     ffmpeg_parameters = t.ffmpeg_parameters
+    if t.source == "youtube" and sources.YT_PROXY:
+        # The stream link is bound to the proxy's IP, so ffmpeg must fetch it through it too.
+        ffmpeg_parameters = f"{ffmpeg_parameters or ''} --audio --start -http_proxy {sources.YT_PROXY}".strip()
     if seek_to is not None:
         ffmpeg_parameters = f"{ffmpeg_parameters or ''} --audio --start -ss {seek_to}".strip()
     kw = dict(

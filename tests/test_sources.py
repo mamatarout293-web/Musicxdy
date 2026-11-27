@@ -94,7 +94,7 @@ class StreamHeaderTests(unittest.TestCase):
 
         result = sources._finish(info)
 
-        playable.assert_called_once_with(info["url"], headers)
+        playable.assert_called_once_with(info["url"], headers, None)
         self.assertEqual(result["headers"], headers)
 
 
