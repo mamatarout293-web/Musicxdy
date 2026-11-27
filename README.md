@@ -18,6 +18,8 @@ COOKIES_URL=... (optional; auto-refreshed cookie export URL)
 COOKIES_REFRESH=21600 (optional; seconds between COOKIES_URL refreshes)
 COOKIES_FROM_BROWSER=auto (optional; imports an existing browser profile when available)
 ENABLE_ALTERNATE_SOURCES=1 (optional; allows Audius/SoundCloud fallback)
+MIN_AUDIO_KBPS=120 (optional; reject lower-bitrate formats)
+VERIFY_YOUTUBE=0 (optional; keep 0, YouTube URLs are IP-bound)
 ```
 3. Railway redeploys. Open **Deployments → View logs**; you should see `starting bot.py`.
 
@@ -38,6 +40,16 @@ Cookie handling is resilient:
   export on a Railway volume (`COOKIES_FILE=/data/cookies.txt`) is picked up without a restart.
 - Each extraction gets a throwaway copy, so yt-dlp can never corrupt the shared cookie file.
 - A bad or expired export keeps the last good cookie file instead of clearing it.
+
+Audio quality and start speed:
+- Audio-only formats are preferred (`bestaudio`, sorted by bitrate/sample rate); YouTube's muxed
+  360p format 18 is accepted only as a last resort.
+- `MIN_AUDIO_KBPS` (default 120) rejects clearly low-bitrate streams before they are played.
+- The last client strategy that produced a good stream is remembered and tried first, so the next
+  song starts faster; repeated queries are cached for 30 minutes.
+- `VERIFY_YOUTUBE=0` (default) skips the extra stream probe. YouTube URLs are bound to the IP that
+  resolved them, so probing them separately can fail and force a slow, low-quality fallback. Set
+  `VERIFY_YOUTUBE=1` only if you need dead-link detection before playback.
 
 It can also try importing cookies from an already logged-in browser profile
 (`COOKIES_FROM_BROWSER=auto`, or e.g. `chrome:Default`). This only imports an existing session; it

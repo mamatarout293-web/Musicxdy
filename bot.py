@@ -325,14 +325,25 @@ async def start_with_fallback(chat_id: int, t: Track):
     raise RuntimeError(f"all available audio sources failed: {last_error}") from last_error
 
 
-async def announce(chat_id: int, t: Track):
-    res = await api("sendMessage", {
+async def announce(chat_id: int, t: Track, message_id: int | None = None) -> int:
+    payload = {
         "chat_id": chat_id, "text": card(t), "parse_mode": "HTML",
         "reply_markup": kb(chat_id, t), "link_preview_options": {"is_disabled": True},
-    }, kb(chat_id, t, plain=True))
+    }
+    res: dict = {}
+    if message_id:
+        payload["message_id"] = message_id
+        res = await api("editMessageText", payload, kb(chat_id, t, plain=True))
+    if not res.get("ok"):
+        # Edit failed (or no message to edit): send a fresh card instead.
+        payload.pop("message_id", None)
+        res = await api("sendMessage", payload, kb(chat_id, t, plain=True))
+        t.msg = res.get("result", {}).get("message_id", 0)
+    else:
+        t.msg = message_id or res.get("result", {}).get("message_id", 0)
     t.chat_id = chat_id
-    t.msg = res.get("result", {}).get("message_id", 0)
     t.task = asyncio.create_task(updater(t))
+    return t.msg
 
 
 def finish(t: Track):
@@ -514,21 +525,23 @@ async def play_query(m: Message, force: bool = False):
         command = "/mxplayforce" if force else "/mxstartplay"
         return await m.reply_text(f"Usage: {command} song name or link")
 
-    # The assistant must be a group member before it can join that group's voice chat.
-    if not await ensure_assistant_in_group(m.chat.id):
-        return await m.reply_text(
+    status = await m.reply_text("Searching…")
+    # Joining the group and resolving the song are independent: overlap them so
+    # the first play is not delayed by the membership check.
+    assistant_task = asyncio.create_task(ensure_assistant_in_group(m.chat.id))
+    try:
+        info = await asyncio.to_thread(sources.resolve, query)
+    except Exception as e:
+        await assistant_task
+        print("search failed:", repr(e)[:400], flush=True)
+        return await status.edit_text("Couldn't find a playable version of that song on any source. "
+                                      "Try another name, or try again in a minute.")
+    if not await assistant_task:
+        return await status.edit_text(
             "I couldn't add the assistant account to this group. "
             "Please make the music bot an admin with permission to invite users, "
             "then try /mxplay again."
         )
-
-    status = await m.reply_text("Searching…")
-    try:
-        info = await asyncio.to_thread(sources.resolve, query)
-    except Exception as e:
-        print("search failed:", repr(e)[:400], flush=True)
-        return await status.edit_text("Couldn't find a playable version of that song on any source. "
-                                      "Try another name, or try again in a minute.")
 
     t = Track(
         title=info.get("title", "Unknown"),
@@ -563,8 +576,12 @@ async def play_query(m: Message, force: bool = False):
         except Exception as e:
             q.clear()
             return await status.edit_text(f"Couldn't start playback. Make sure a voice chat is open and the assistant is in the group.\n{e}")
-        await status.delete()
-        await announce(m.chat.id, t)
+        used = await announce(m.chat.id, t, message_id=status.id)
+        if used != status.id:
+            try:
+                await status.delete()
+            except Exception:
+                pass
     else:
         await status.delete()
         await api("sendMessage", {"chat_id": m.chat.id, "parse_mode": "HTML",

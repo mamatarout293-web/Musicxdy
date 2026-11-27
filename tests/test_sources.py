@@ -271,6 +271,12 @@ class CookieStoreTests(unittest.TestCase):
 
 
 class YoutubeAttemptOrderTests(unittest.TestCase):
+    def setUp(self):
+        sources._LAST_GOOD = None
+
+    def tearDown(self):
+        sources._LAST_GOOD = None
+
     @patch("sources._browser_cookie_specs", return_value=[])
     def test_cookie_less_high_quality_client_runs_first(self, _browsers):
         with patch.object(sources, "COOKIES", None):
@@ -321,6 +327,44 @@ class YoutubeAttemptOrderTests(unittest.TestCase):
 
         self.assertEqual(result, [{"id": "x"}])
         self.assertEqual(used_cookies, [False, True])
+
+
+class QualityGateTests(unittest.TestCase):
+    def test_rejects_muxed_format_without_audio_bitrate(self):
+        info = {"url": "https://example/stream", "source": "youtube",
+                "vcodec": "avc1.42001E", "abr": None, "asr": None}
+        with self.assertRaises(RuntimeError):
+            sources._finish(info)
+
+    def test_allows_muxed_format_as_last_resort(self):
+        info = {"url": "https://example/stream", "source": "youtube",
+                "vcodec": "avc1.42001E", "abr": None, "asr": None}
+        self.assertEqual(sources._finish(info, allow_low_quality=True), info)
+
+    @patch("sources.playable", side_effect=AssertionError("must not probe YouTube"))
+    def test_youtube_stream_is_not_probed_by_default(self, _playable):
+        info = {"url": "https://example/stream", "source": "youtube",
+                "vcodec": "none", "abr": 138.8, "asr": 48000}
+        self.assertEqual(sources._finish(info), info)
+
+    @patch("sources.playable", return_value=True)
+    def test_youtube_stream_is_probed_when_enabled(self, playable):
+        info = {"url": "https://example/stream", "source": "youtube",
+                "vcodec": "none", "abr": 138.8, "asr": 48000}
+        with patch.object(sources, "VERIFY_YOUTUBE", True):
+            self.assertEqual(sources._finish(info), info)
+        playable.assert_called_once()
+
+    def test_last_good_attempt_moves_to_front(self):
+        good = sources.YT_ATTEMPTS[4]
+        with patch.object(sources, "COOKIES", None), \
+                patch.object(sources, "_browser_cookie_specs", return_value=[]):
+            sources._LAST_GOOD = good
+            try:
+                attempts = sources._yt_attempts()
+            finally:
+                sources._LAST_GOOD = None
+        self.assertEqual(attempts[0], good)
 
 
 if __name__ == "__main__":

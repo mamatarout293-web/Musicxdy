@@ -46,6 +46,14 @@ URL_RE = re.compile(r"^https?://", re.I)
 # Optional HTTP proxy (ideally residential) used ONLY for YouTube. YouTube stream
 # links are locked to the IP that resolved them, so playback must use it too.
 YT_PROXY = os.environ.get("YT_PROXY", "").strip() or None
+# Verifying a YouTube stream URL costs an extra round-trip and can fail when the
+# signed URL is bound to the proxy/IP that resolved it. Playback fails fast on a
+# dead link, so verification is opt-in for YouTube (VERIFY_YOUTUBE=1).
+VERIFY_YOUTUBE = os.environ.get("VERIFY_YOUTUBE", "0").strip().lower() in {"1", "true", "yes", "on"}
+try:
+    MIN_AUDIO_KBPS = float(os.environ.get("MIN_AUDIO_KBPS", "120") or 120)
+except ValueError:
+    MIN_AUDIO_KBPS = 120.0
 
 
 class NotFound(Exception):
@@ -113,25 +121,31 @@ def playable(url: str, headers: dict | None = None, proxy: str | None = None) ->
         return False
 
 
-def _finish(info: dict) -> dict:
+def _finish(info: dict, allow_low_quality: bool = False) -> dict:
     if not info.get("url"):
         raise RuntimeError("no stream url")
-    # Reject formats explicitly identified as low quality. Unknown metadata is
-    # allowed because some providers do not publish bitrate/sample-rate fields.
+    source = info.get("source") or ""
+    abr = asr = 0
     try:
         abr = float(info.get("abr") or 0)
-        if abr and abr < 128:
-            raise RuntimeError(f"{info.get('source')}: audio bitrate below 128 kbps ({abr:.0f} kbps)")
         asr = int(info.get("asr") or 0)
-        if asr and asr < 32000:
-            raise RuntimeError(f"{info.get('source')}: sample rate too low ({asr} Hz)")
     except (TypeError, ValueError):
         pass
-    headers = info.get("headers") or {}
-    if not playable(info["url"], headers, YT_PROXY if info.get("source") == "youtube" else None):
-        raise RuntimeError(f"{info.get('source')}: stream not reachable")
-    # MediaStream expects a mapping of individual HTTP header names to values.
-    # Keep them separate: folding Referer/Accept into User-Agent creates one invalid header.
+    vcodec = str(info.get("vcodec") or "none").lower()
+    muxed = vcodec not in {"none", ""}
+    if not allow_low_quality:
+        if abr and abr < MIN_AUDIO_KBPS:
+            raise RuntimeError(f"{source}: audio bitrate below {MIN_AUDIO_KBPS:.0f} kbps ({abr:.0f} kbps)")
+        if asr and asr < 32000:
+            raise RuntimeError(f"{source}: sample rate too low ({asr} Hz)")
+        # Audio-only is preferred. A muxed video with no audio bitrate info is
+        # usually YouTube's low-quality 360p format 18.
+        if muxed and not abr:
+            raise RuntimeError(f"{source}: only a muxed video format is available")
+    verify = source != "youtube" or VERIFY_YOUTUBE
+    if verify and not playable(info["url"], info.get("headers") or {},
+                               YT_PROXY if source == "youtube" else None):
+        raise RuntimeError(f"{source}: stream not reachable")
     return info
 
 
@@ -413,12 +427,13 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
               proxy: str | None = None) -> dict:
     o = {
         "format": "bestaudio[acodec!=none]/best[acodec!=none]/best",
+        "format_sort": ["abr", "asr"],
         "js_runtimes": {"deno": {}, "node": {}},
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "socket_timeout": 10,
+        "socket_timeout": 8,
         "retries": 1,
         "extractor_retries": 1,
         "extractor_args": {
@@ -487,6 +502,9 @@ def _norm(info: dict, source: str) -> dict:
         "abr": info.get("abr"),
         "asr": info.get("asr"),
         "acodec": info.get("acodec"),
+        "vcodec": info.get("vcodec"),
+        "format_id": info.get("format_id"),
+        "height": info.get("height"),
         "source": source,
     }
 
@@ -497,11 +515,17 @@ def _norm(info: dict, source: str) -> dict:
 YT_ATTEMPTS = [
     {"clients": ["default"], "cookies": False},                              # best audio, no cookies
     {"clients": ["default"], "cookies": True},                               # signed-in (age/region)
-    {"clients": ["tv", "web_safari"], "cookies": False},                     # PO-token provider
-    {"clients": ["tv", "web_safari"], "cookies": True},                      # PO token + cookies
+    {"clients": ["tv", "web_safari", "mweb", "android_vr"], "cookies": False},  # PO-token provider
+    {"clients": ["tv", "web_safari", "mweb", "android_vr"], "cookies": True},   # PO token + cookies
     {"clients": ["tv_embedded", "tv_samsung", "visionos"], "cookies": False},  # explicit high-quality clients
-    {"clients": ["tv_simply", "mweb", "android_vr"], "cookies": False},      # last resort (muxed, lower bitrate)
+    {"clients": ["tv_embedded", "tv_samsung", "visionos"], "cookies": True},
+    {"clients": ["tv_simply", "mweb", "android_vr"], "cookies": False,       # last resort (muxed, lower bitrate)
+     "low_quality": True},
 ]
+
+# Remember the last client strategy that produced a high-quality stream so the
+# next song starts immediately instead of re-walking failed attempts.
+_LAST_GOOD: dict | None = None
 
 
 _YT_CACHE: dict[str, tuple[float, dict]] = {}
@@ -530,7 +554,24 @@ def _yt_attempts() -> list[dict]:
     # browser profile. This cannot create a Google login or bypass verification.
     for browser_spec in _browser_cookie_specs():
         attempts.append({"browser": browser_spec, "cookies": False})
+    if _LAST_GOOD is not None:
+        for i, a in enumerate(attempts):
+            if a == _LAST_GOOD:
+                attempts.insert(0, attempts.pop(i))
+                break
     return attempts
+
+
+def _note_quality(attempt: dict, info: dict) -> None:
+    global _LAST_GOOD
+    if not attempt.get("low_quality"):
+        _LAST_GOOD = attempt
+    try:
+        rate = f"{float(info.get('abr')):.0f} kbps" if info.get("abr") else "bitrate unknown"
+    except (TypeError, ValueError):
+        rate = "bitrate unknown"
+    log(f"youtube stream: {info.get('format_id') or '?'} {info.get('acodec') or '?'} "
+        f"{rate} {info.get('asr') or '?'} Hz")
 
 
 def _yt_extract(url: str) -> dict:
@@ -538,12 +579,15 @@ def _yt_extract(url: str) -> dict:
     refresh_cookies()
     last: Exception | None = None
     for a in _yt_attempts():
+        allow_low = bool(a.get("low_quality"))
         used_cookies = bool(a.get("cookies", True) and COOKIES)
         try:
             entries = _ydl_entries(
                 _ydl_opts(a.get("cookies", True), a.get("clients"), a.get("browser"), YT_PROXY), url
             )
-            return _finish(_norm(entries[0], "youtube"))
+            info = _finish(_norm(entries[0], "youtube"), allow_low_quality=allow_low)
+            _note_quality(a, info)
+            return info
         except NotFound as e:
             last = e
         except Exception as e:
@@ -555,7 +599,9 @@ def _yt_extract(url: str) -> dict:
                     entries = _ydl_entries(
                         _ydl_opts(cookies=False, clients=a.get("clients"), proxy=YT_PROXY), url
                     )
-                    return _finish(_norm(entries[0], "youtube"))
+                    info = _finish(_norm(entries[0], "youtube"), allow_low_quality=allow_low)
+                    _note_quality(a, info)
+                    return info
                 except Exception as retry_error:
                     last = retry_error
                     log("youtube retry without cookies failed:", str(retry_error)[:160])
@@ -607,7 +653,7 @@ def _youtube(target: str) -> dict:
         if _relevant(search_query, e.get("title", ""), artist_of(e))
         and not _variant_unwanted(search_query, e.get("title", ""), artist_of(e))
         and _match_score(search_query, e.get("title", ""), artist_of(e)) >= 5.0
-    ][:3]
+    ][:2]
     if not candidates:
         raise NotFound("youtube: no acceptable search result")
     last: Exception | None = None
@@ -802,7 +848,7 @@ def _build() -> list[Source]:
     # Spotify is used only to identify the canonical track; it does not provide audio streams.
     youtube_enabled = os.environ.get("ENABLE_YOUTUBE", "1").strip().lower() in {"1", "true", "yes", "on"}
     if youtube_enabled:
-        s.append(Source("youtube", lambda q: _youtube(f"ytsearch10:{q}")))
+        s.append(Source("youtube", lambda q: _youtube(f"ytsearch5:{q}")))
     # Alternate user uploads are disabled by default: they often return covers,
     # edits, or low-quality copies. Enable only as an explicit last-resort choice.
     if os.environ.get("ENABLE_ALTERNATE_SOURCES", "").strip().lower() in {"1", "true", "yes", "on"}:
@@ -875,7 +921,7 @@ def _direct(url: str, kind: str) -> dict:
     if kind == "youtube":
         return _youtube(url)
     entries = _ydl_entries(_ydl_opts(cookies=False), url)
-    return _finish(_norm(entries[0], kind))
+    return _finish(_norm(entries[0], kind), allow_low_quality=True)
 
 
 # ───────────────────────── main entry ─────────────────────────
@@ -924,7 +970,8 @@ def resolve(query: str, skip=()) -> dict:
                 source = futures.pop(future)
                 info, error = future.result()
                 if error is None:
-                    log(f"'{query[:50]}' -> {source.name}")
+                    log(f"'{query[:50]}' -> {source.name} "
+                        f"({info.get('abr') or '?'} kbps, {info.get('asr') or '?'} Hz)")
                     for pending in futures:
                         pending.cancel()
                     return info
