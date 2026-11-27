@@ -152,7 +152,13 @@ def _finish(info: dict, allow_low_quality: bool = False) -> dict:
 
 
 _STOP = {"official", "video", "audio", "lyrics", "lyric", "song", "full", "new", "hd",
-         "the", "a", "of", "ft", "feat", "and", "by", "original", "version", "music"}
+         "the", "a", "of", "ft", "feat", "and", "by", "original", "version", "music",
+         # Language/industry hints are not part of the song name.
+         "hindi", "english", "bengali", "bangla", "odia", "oriya", "punjabi",
+         "tamil", "telugu", "kannada", "malayalam", "marathi", "gujarati",
+         "bhojpuri", "assamese", "urdu", "sanskrit", "sambalpuri", "haryanvi",
+         "rajasthani", "konkani", "kashmiri", "nepali", "sinhala",
+         "indian", "bollywood", "tollywood", "kollywood", "sandalwood"}
 
 
 def _tokens(s: str) -> set[str]:
@@ -210,10 +216,19 @@ _VARIANT_HARD = re.compile(
     r"ai\s*(?:cover|version)|"
     r"video\s*edit|fan\s*edit|"
     r"concert|festival|performance|unplugged|remake|"
-    r"interview|podcast)\b", re.I
+    r"interview|podcast)\b|"
+    r"कवर|रीमिक्स|रिमिक्स|स्लोड|रिवर्ब|8डी|"
+    r"কভার|রিমিক্স|রিমিক্স|স্লোড|রিভার্ব|৮ডি|"
+    r"ਕਵਰ|ਰੀਮਿਕਸ|ਸਲੋ|ਰੀਵਰਬ|8ਡੀ|"
+    r"କଭର|ରିମିକ୍ସ|ସ୍ଲୋ|ରିଭର୍ବ|8ଡି|"
+    r"கவர்|ரீமிக்ஸ்|ஸ்லோ|ரிவர்ப்|8டி|"
+    r"కవర్|రీమిక్స్|స్లో|రివర్బ్|8డి", re.I
 )
 # Lyrics videos are a softer fallback: used only when nothing official exists.
-_VARIANT_SOFT = re.compile(r"\b(?:lyrics?|lyric\s*video)\b", re.I)
+_VARIANT_SOFT = re.compile(
+    r"\b(?:lyrics?|lyric\s*video)\b|"
+    r"लिरिक्स|লিরিক্স|ਲਿਰਿਕਸ|ଲିରିକ୍ସ|பாடல்\s*வரிகள்|సాహిత్యం", re.I
+)
 _OFFICIAL_TITLE = re.compile(
     r"\b(?:official\s*(?:music\s*)?(?:video|audio|visuali[sz]er)|"
     r"official\s+(?:lyric|lyrics)\s*video|official)\b", re.I
@@ -226,8 +241,94 @@ _LABEL_CHANNEL = re.compile(
     r"ultra|wave music|srg|venus|eros|shemaroo|rajshri|aditya music|"
     r"lahari|think music|junglee|warner music|universal music|atlantic|"
     r"columbia|rca|capitol|interscope|republic|island|def jam|empire|"
-    r"300 entertainment|vevo|topic)\b", re.I
+    r"300 entertainment|vevo|topic|"
+    # Bengali
+    r"svf|eskay|grassroot|surinder|jeetz|amara muzik|asha audio|cozmik|"
+    r"dhrubo|mayur|saregama bangla|sony music east|zee music bangla|"
+    r"times music bangla|t[- ]?series bangla|rdc bangla|angel digital|"
+    r"orion multimedia|pinky audio|soundtek|shemaroo bangla|rtv music|"
+    r"anupam movie songs|"
+    # Odia
+    r"sarthak|dhoom music|tarang music|tarang tv|tarang cine|kanak music|"
+    r"odiaone|sidharth music|astar music|suriya music|global music junction|"
+    r"saregama odia|zee music odia|sony music odia|"
+    r"t[- ]?series odia|aditya music odia|jagannath music|laxmi music|"
+    r"bhabani music|rudra music|maa tarini music|"
+    # Punjabi
+    r"humble music|t[- ]?series apna punjab|rehaan records|moviebox|"
+    r"vip records|finetouch|jass records|gold media|5911 records|"
+    r"single track studios|burfi music|navrattan|ptc records|planet recordz|"
+    r"lokdhun|gem tunes|saregama punjabi|zee music punjabi|"
+    r"sony music punjabi|times music punjabi|ishtar punjabi|brown studios|"
+    r"crown records|"
+    # English / international
+    r"fueled by ramen|big machine|young money|ovo|xo|good music|top dawg|"
+    r"aftermath|shady|quality control|alamo|sub pop|xl recordings|domino|"
+    r"88rising|monstercat|spinnin|armada|anjunabeats|defected|"
+    r"ministry of sound|because music)\b", re.I
 )
+_LATIN_TEXT = re.compile(r"[A-Za-z]")
+_NON_LATIN_TEXT = re.compile(r"[^\x00-\x7F]")
+
+# Language hints are removed from coverage (so "jhumka odia" still matches "Jhumka")
+# but they bias ranking towards that language's labels and script.
+_LANG_HINTS = {
+    "hindi": (["hindi", "हिंदी", "हिन्दी"],
+              ["t-series", "sony music india", "zee music", "tips", "yrf",
+               "saregama", "wave music", "srg", "aditya music"]),
+    "english": (["english"],
+                ["fueled by ramen", "big machine", "atlantic", "columbia", "rca",
+                 "capitol", "interscope", "republic", "island", "universal music",
+                 "warner music"]),
+    "bengali": (["bengali", "bangla", "বাংলা"],
+                ["svf", "eskay", "surinder", "grassroot", "amara muzik",
+                 "saregama bangla", "zee music bangla", "sony music east",
+                 "times music bangla", "rtv music", "anupam movie songs"]),
+    "odia": (["odia", "oriya", "sambalpuri", "ଓଡ଼ିଆ", "ଓଡିଆ"],
+             ["tarang", "sarthak", "dhoom music", "kanak music", "sidharth music",
+              "amara muzik", "odiaone", "astar music", "suriya music",
+              "global music junction"]),
+    "punjabi": (["punjabi", "ਪੰਜਾਬੀ"],
+                ["speed records", "white hill", "humble music", "saga music",
+                 "ishtar punjabi", "rehaan", "moviebox", "t-series apna punjab",
+                 "ptc records", "planet recordz"]),
+    "tamil": (["tamil", "தமிழ்"],
+              ["think music", "sony music south", "lahari", "aditya music",
+               "divo", "saregama tamil"]),
+    "telugu": (["telugu", "తెలుగు"],
+               ["aditya music", "lahari", "sony music south", "zee music south",
+                "saregama telugu", "mango music", "madhura audio"]),
+}
+_LANG_SCRIPTS = {
+    "hindi": "\u0900-\u097F",
+    "bengali": "\u0980-\u09FF",
+    "punjabi": "\u0A00-\u0A7F",
+    "odia": "\u0B00-\u0B7F",
+    "tamil": "\u0B80-\u0BFF",
+    "telugu": "\u0C00-\u0C7F",
+}
+
+
+def _language_bonus(query: str, title: str, channel: str) -> float:
+    q = (query or "").lower()
+    text = f"{title} {channel}".lower()
+    bonus = 0.0
+    for lang, (words, labels) in _LANG_HINTS.items():
+        if not any(word in q for word in words):
+            continue
+        script = _LANG_SCRIPTS.get(lang)
+        if (any(word in text for word in words)
+                or any(label in text for label in labels)
+                or (script and re.search(f"[{script}]", text))):
+            bonus += 3.0
+    return bonus
+
+
+def _script_mismatch(query: str, text: str) -> bool:
+    """Latin query with no token overlap against a title that contains native script."""
+    if not _LATIN_TEXT.search(query or "") or not _NON_LATIN_TEXT.search(text or ""):
+        return False
+    return _coverage(_tokens(query), _tokens(text)) == 0
 
 
 def _variant_unwanted(query: str, title: str, artist: str = "",
@@ -300,6 +401,7 @@ def _match_score(query: str, title: str, artist: str = "",
     if views:
         # Popular uploads are usually the real song; cap so it cannot hide official signals.
         score += min(14.0, math.log10(views) * 1.8)
+    score += _language_bonus(query, title, artist)
     if duration:
         if duration < 90 or duration > 900:
             score -= 4
@@ -310,8 +412,8 @@ def _match_score(query: str, title: str, artist: str = "",
     return score
 
 
-def _candidate_ok(query: str, entry: dict, min_coverage: float = 0.7,
-                  allow_soft: bool = False) -> bool:
+def _candidate_basic_ok(query: str, entry: dict, allow_soft: bool = False) -> bool:
+    """Variant, live, view-count and duration checks; no title/query coverage."""
     title = entry.get("title") or ""
     artist = entry.get("artist") or entry.get("uploader") or entry.get("channel") or ""
     if _variant_unwanted(query, title, artist, allow_soft=allow_soft):
@@ -332,6 +434,15 @@ def _candidate_ok(query: str, entry: dict, min_coverage: float = 0.7,
     # Short clips are usually TikTok/Shorts edits; very long ones are loops.
     if duration and (duration < 45 or duration > 1200):
         return False
+    return True
+
+
+def _candidate_ok(query: str, entry: dict, min_coverage: float = 0.7,
+                  allow_soft: bool = False) -> bool:
+    if not _candidate_basic_ok(query, entry, allow_soft):
+        return False
+    title = entry.get("title") or ""
+    artist = entry.get("artist") or entry.get("uploader") or entry.get("channel") or ""
     return _coverage(_tokens(query), _tokens(f"{title} {artist}")) >= min_coverage
 
 
@@ -629,6 +740,23 @@ def _ydl_entries(opts: dict, target: str) -> list[dict]:
     return _extract_entries(opts, target)
 
 
+def _thumb_candidates(info: dict, source: str = "") -> list[str]:
+    """Highest-resolution artwork first; maxres/maxres1-3 are 1280x720 HD stills."""
+    urls: list[str] = []
+    if source == "youtube" and info.get("id"):
+        # maxresdefault is missing on some videos; maxres1/2/3 are still 1280x720.
+        for name in ("maxresdefault", "maxres1", "maxres2", "maxres3",
+                     "sddefault", "hqdefault"):
+            urls.append(f"https://i.ytimg.com/vi/{info['id']}/{name}.jpg")
+    for thumb in sorted(info.get("thumbnails") or [],
+                        key=lambda x: x.get("width") or 0, reverse=True):
+        if thumb.get("url"):
+            urls.append(thumb["url"])
+    if info.get("thumbnail"):
+        urls.append(info["thumbnail"])
+    return list(dict.fromkeys(url for url in urls if url))
+
+
 def _norm(info: dict, source: str) -> dict:
     return {
         "title": info.get("title") or "Unknown",
@@ -643,6 +771,8 @@ def _norm(info: dict, source: str) -> dict:
         "vcodec": info.get("vcodec"),
         "format_id": info.get("format_id"),
         "height": info.get("height"),
+        "thumbnails": _thumb_candidates(info, source),
+        "official": bool(info.get("official")),
         "source": source,
     }
 
@@ -873,9 +1003,20 @@ def _youtube(target: str) -> dict:
         )
 
     ranked = sorted(entries, key=score, reverse=True)
-    official_candidates = [
-        e for e in ranked if is_official(e) and _candidate_ok(search_query, e, 0.7)
-    ]
+    official_candidates = []
+    for e in ranked:
+        if not is_official(e):
+            continue
+        if _candidate_ok(search_query, e, 0.7):
+            official_candidates.append(e)
+            continue
+        # A Latin query ("tumi robe nirobe") cannot match a Bengali title. Trust
+        # YouTube relevance for a known label only near the top of the results.
+        if (_candidate_basic_ok(search_query, e)
+                and _script_mismatch(search_query, e.get("title", ""))
+                and _LABEL_CHANNEL.search(channel_of(e))
+                and (e.get("_rank") or 99) < 5):
+            official_candidates.append(e)
     # Lyrics uploads usually reuse the official audio; never fall back to arbitrary covers.
     lyrics_candidates = [
         e for e in ranked
@@ -901,7 +1042,16 @@ def _youtube(target: str) -> dict:
             if _is_bot_check(err):
                 raise  # same block applies to every candidate; fail fast
             continue
-        log("youtube pick:", f"{e.get('title', '')[:70]} | {channel_of(e)} | {e.get('view_count') or 0} views")
+        chosen_official = is_official(e)
+        info["official"] = chosen_official
+        if chosen_official:
+            info["thumbnails"] = _thumb_candidates(e, "youtube")
+        elif official_candidates:
+            # Lyrics fallback: keep the official song's artwork, not the lyrics channel's.
+            info["thumbnails"] = _thumb_candidates(official_candidates[0], "youtube")
+        else:
+            info["thumbnails"] = []
+        log("youtube pick:", f"{e.get('title', '')[:70]} | {channel_of(e)} | {e.get('view_count') or 0} views | official={chosen_official}")
         _YT_CACHE[target] = (time.time(), info)
         return info
     raise last or NotFound("youtube: no playable result")

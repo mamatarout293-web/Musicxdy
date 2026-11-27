@@ -399,6 +399,60 @@ class SearchMatchingTests(unittest.TestCase):
         self.assertFalse(sources._variant_unwanted(
             "believer remix", "Believer (Remix)", ""))
 
+    def test_regional_labels_are_official(self):
+        for channel in [
+            "SVF Music", "Eskay Movies", "Surinder Films", "RTV Music",
+            "Sarthak Music", "Dhoom Music", "Tarang TV", "Suriya Music Official",
+            "Humble Music", "Speed Records", "Saregama Punjabi",
+            "Fueled by Ramen", "Big Machine Records",
+        ]:
+            self.assertTrue(sources._is_official("Song", channel, "song"), channel)
+
+    def test_language_hint_is_removed_from_coverage_but_biases_ranking(self):
+        entry = {"title": "Jhumka", "channel": "Suriya Music",
+                 "duration": 200, "view_count": 1_000_000}
+        self.assertTrue(sources._candidate_ok("jhumka odia", entry))
+        odia = sources._match_score(
+            "jhumka odia", "JHUMKA | SAMBALPURI SONG", "Suriya Music Official",
+            227, True, 29_000_000)
+        hindi = sources._match_score(
+            "jhumka odia", "Jhumka Patola", "Himesh Reshammiya Melodies",
+            218, True, 139_000_000)
+        self.assertGreater(odia, hindi)
+
+    def test_script_mismatch_for_latin_query_and_native_title(self):
+        self.assertTrue(sources._script_mismatch(
+            "tumi robe nirobe", "তুমি রবে নীরবে"))
+        self.assertTrue(sources._script_mismatch(
+            "kannaana kanney", "கண்ணான கண்ணே"))
+        self.assertFalse(sources._script_mismatch(
+            "tumi robe nirobe", "Tumi Robe Nirobe"))
+        self.assertFalse(sources._script_mismatch(
+            "arijit singh", "Arijit Singh - তুমি রবে নীরবে"))
+
+    def test_native_variant_words_are_filtered(self):
+        self.assertTrue(sources._variant_unwanted(
+            "song", "গানটি কভার", ""))
+        self.assertTrue(sources._variant_unwanted(
+            "song", "ਗੀਤ ਦਾ ਰੀਮਿਕਸ", ""))
+        self.assertTrue(sources._variant_unwanted(
+            "song", "ଗୀତ କଭର", ""))
+        self.assertTrue(sources._variant_unwanted(
+            "song", "गाना लिरिक्स", ""))
+
+    def test_thumbnail_candidates_prefer_maxres(self):
+        urls = sources._thumb_candidates(
+            {"id": "abc123", "webpage_url": "https://www.youtube.com/watch?v=abc123"},
+            "youtube")
+        self.assertEqual(urls[0], "https://i.ytimg.com/vi/abc123/maxresdefault.jpg")
+        self.assertIn("https://i.ytimg.com/vi/abc123/maxres1.jpg", urls)
+        self.assertIn("https://i.ytimg.com/vi/abc123/sddefault.jpg", urls)
+
+    def test_thumbnail_candidates_for_other_sources(self):
+        urls = sources._thumb_candidates(
+            {"id": "1", "thumbnail": "https://example.com/a.jpg"}, "soundcloud")
+        self.assertEqual(urls, ["https://example.com/a.jpg"])
+
     def test_official_upload_is_detected(self):
         self.assertTrue(sources._is_official(
             "Imagine Dragons - Believer (Official Music Video)",

@@ -1,4 +1,4 @@
-"""Clean voice-chat music bot. Best-quality audio, plain text, no thumbnails, no effects."""
+"""Clean voice-chat music bot. Best-quality audio, official HD artwork card, no effects."""
 import asyncio
 
 # One event loop for everything: pyrogram binds to the loop that exists when it is created.
@@ -91,6 +91,9 @@ class Track:
     resolved_at: float = 0.0
     retries: int = 0
     bad: set = field(default_factory=set)  # sources that already failed for this track
+    thumbs: list = field(default_factory=list)  # official HD artwork URLs, best first
+    official: bool = False
+    has_photo: bool = False
 
 
 queues: dict[int, list[Track]] = {}
@@ -113,6 +116,8 @@ async def reresolve(t: Track):
     t.url, t.headers, t.source = info["url"], info.get("headers") or {}, info["source"]
     t.page = info.get("page") or t.page
     t.duration = info.get("duration") or t.duration
+    t.thumbs = info.get("thumbnails") or t.thumbs
+    t.official = bool(info.get("official", t.official))
     t.resolved_at = time.time()
 
 
@@ -171,12 +176,9 @@ async def load_emojis():
     print("Premium emojis:", {r: bool(v[1]) for r, v in EMO.items()})
 
 
-def pe(role: str) -> str:
+def pe(role: str, plain: bool = False) -> str:
     ch, cid = EMO.get(role, (ROLES[role][0], ""))
-    return f'<tg-emoji emoji-id="{cid}">{ch}</tg-emoji>' if cid else ch
-
-
-LINE = "━━━━━━━━━━━━━━━━━━"
+    return ch if plain or not cid else f'<tg-emoji emoji-id="{cid}">{ch}</tg-emoji>'
 
 
 def elapsed(t: Track) -> int:
@@ -184,17 +186,26 @@ def elapsed(t: Track) -> int:
     return max(0, min(int(now - t.started), t.duration or 10**9))
 
 
-def card(t: Track) -> str:
+def _clip(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:max(0, limit - 1)].rstrip() + "…"
+
+
+def card(t: Track, plain: bool = False) -> str:
     e, d = elapsed(t), t.duration
-    filled = round(12 * e / d) if d else 0
-    bar = "▰" * filled + "▱" * (12 - filled)
-    icon = pe("pause") if t.paused_at else pe("play")
-    head = f"{pe('pause')} <b>PAUSED</b>" if t.paused_at else f"{pe('now')} <b>NOW PLAYING</b>"
-    artist = f"\n{html.escape(t.artist)}" if t.artist else ""
+    filled = round(10 * e / d) if d else 0
+    bar = "▰" * filled + "▱" * (10 - filled)
+    icon = pe("pause", plain) if t.paused_at else pe("play", plain)
+    head = f"{pe('pause', plain)} <b>PAUSED</b>" if t.paused_at else f"{pe('now', plain)} <b>NOW PLAYING</b>"
+    # Fixed five-line caption: one line each for title, artist and requester.
+    # Clipping keeps the photo bubble the same rectangle for every song.
+    title = html.escape(_clip(t.title.upper(), 34))
+    artist = html.escape(_clip(t.artist or "Unknown artist", 30))
+    by = html.escape(_clip(t.by, 20))
     return (
-        f"{head}\n\n<b>{html.escape(t.title.upper())}</b>{artist}\n\n{LINE}\n"
-        f"{icon}  {bar}  <code>{fmt(e)} / {fmt(d)}</code>\n\n"
-        f"{pe('user')} Requested by: {html.escape(t.by)}\n{LINE}"
+        f"{head}\n<b>{title}</b>\n{artist}\n"
+        f"{icon}  {bar}  <code>{fmt(e)} / {fmt(d)}</code>\n"
+        f"{pe('user', plain)} {by}"
     )
 
 
@@ -232,18 +243,33 @@ def kb(chat_id: int, t: Track, plain: bool = False) -> dict:
 
     pause = B("play", "Resume", "resume", "success") if t.paused_at else B("pause", "Pause", "pause", "success")
     on = loop.get(chat_id)
+    # Two buttons per row: labels never overflow the photo bubble on a narrow phone.
     return {"inline_keyboard": [
-        [B("prev", "Previous", "prev", "primary"), pause, B("skip", "Skip", "skip", "primary")],
-        [B("shuffle", "Shuffle", "shuffle", "primary"),
-         B("loop", "Loop ✓" if on else "Loop", "loop", "success" if on else "primary"),
+        [B("prev", "Prev", "prev", "primary"), pause],
+        [B("skip", "Skip", "skip", "primary"), B("shuffle", "Shuffle", "shuffle", "primary")],
+        [B("loop", "Loop ✓" if on else "Loop", "loop", "success" if on else "primary"),
          B("stop", "Stop", "stop", "danger")],
     ]}
 
 
 async def refresh(chat_id: int, t: Track):
+    if t.has_photo:
+        res = await api("editMessageCaption", {
+            "chat_id": chat_id, "message_id": t.msg,
+            "caption": card(t), "parse_mode": "HTML",
+            "reply_markup": kb(chat_id, t),
+        }, kb(chat_id, t, plain=True))
+        if not res.get("ok") and "not modified" not in str(res.get("description", "")):
+            await api("editMessageCaption", {
+                "chat_id": chat_id, "message_id": t.msg,
+                "caption": card(t, plain=True), "parse_mode": "HTML",
+                "reply_markup": kb(chat_id, t, plain=True),
+            })
+        return
     await api("editMessageText", {
-        "chat_id": chat_id, "message_id": t.msg, "text": card(t), "parse_mode": "HTML",
-        "reply_markup": kb(chat_id, t), "link_preview_options": {"is_disabled": True},
+        "chat_id": chat_id, "message_id": t.msg, "text": card(t),
+        "parse_mode": "HTML", "reply_markup": kb(chat_id, t),
+        "link_preview_options": {"is_disabled": True},
     }, kb(chat_id, t, plain=True))
 
 
@@ -344,22 +370,45 @@ async def start_with_fallback(chat_id: int, t: Track):
 
 
 async def announce(chat_id: int, t: Track, message_id: int | None = None) -> int:
-    payload = {
-        "chat_id": chat_id, "text": card(t), "parse_mode": "HTML",
-        "reply_markup": kb(chat_id, t), "link_preview_options": {"is_disabled": True},
-    }
-    res: dict = {}
+    if t.task:
+        t.task.cancel()
     if message_id:
-        payload["message_id"] = message_id
-        res = await api("editMessageText", payload, kb(chat_id, t, plain=True))
-    if not res.get("ok"):
-        # Edit failed (or no message to edit): send a fresh card instead.
-        payload.pop("message_id", None)
-        res = await api("sendMessage", payload, kb(chat_id, t, plain=True))
-        t.msg = res.get("result", {}).get("message_id", 0)
-    else:
-        t.msg = message_id or res.get("result", {}).get("message_id", 0)
+        # The old text status cannot become a photo; remove it and send a fresh card.
+        await api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
     t.chat_id = chat_id
+    t.has_photo = False
+    res: dict = {}
+    # Official HD artwork first (maxres, maxres1-3, then sd/hq fallbacks). Telegram
+    # fetches the URL itself, so no image bytes pass through this container.
+    for plain in (False, True):
+        for photo in (t.thumbs or [])[:8]:
+            res = await api("sendPhoto", {
+                "chat_id": chat_id, "photo": photo,
+                "caption": card(t, plain=plain),
+                "parse_mode": "HTML",
+                "reply_markup": kb(chat_id, t, plain=plain),
+            })
+            if res.get("ok"):
+                t.msg = res.get("result", {}).get("message_id", 0)
+                t.has_photo = True
+                break
+        if t.has_photo:
+            break
+    if not t.has_photo:
+        if t.thumbs:
+            kind = "official" if t.official else "fallback"
+            print(f"photo card failed ({kind}), using text card:",
+                  (t.thumbs or [""])[0][:100], flush=True)
+        payload = {
+            "chat_id": chat_id, "text": card(t),
+            "parse_mode": "HTML", "reply_markup": kb(chat_id, t),
+            "link_preview_options": {"is_disabled": True},
+        }
+        res = await api("sendMessage", payload, kb(chat_id, t, plain=True))
+        if not res.get("ok"):
+            payload["text"] = card(t, plain=True)
+            res = await api("sendMessage", payload, kb(chat_id, t, plain=True))
+        t.msg = res.get("result", {}).get("message_id", 0)
     t.task = asyncio.create_task(updater(t))
     return t.msg
 
@@ -572,6 +621,8 @@ async def play_query(m: Message, force: bool = False):
         source=info.get("source", ""),
         query=query,
         resolved_at=time.time(),
+        thumbs=info.get("thumbnails") or [],
+        official=bool(info.get("official")),
     )
     if force:
         previous = queues.pop(m.chat.id, [])

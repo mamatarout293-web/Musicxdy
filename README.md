@@ -50,13 +50,18 @@ Audio quality and start speed:
   much quieter/louder than the next and peaks do not clip. Set `0` to disable.
 - Search is typo-tolerant (for example, `believr` still finds `Believer`).
 - Official uploads are detected from verified channels, known labels (T-Series, Sony Music,
-  Zee Music, Tips, YRF, Saregama, etc.), Topic/VEVO, and the artist's own channel. A title that
+  Zee Music, Tips, YRF, Saregama, SVF, Surinder, Sarthak, Tarang, Speed Records, Humble Music,
+  Fueled by Ramen, Big Machine, etc.), Topic/VEVO, and the artist's own channel. A title that
   merely says "official" is not trusted, because re-uploads use that word too.
 - Among official uploads, the popular version wins (view count), so a random re-upload cannot
   outrank the real song.
+- Language hints ("odia", "bengali", "punjabi", ...) are removed from title matching but bias
+  ranking towards that language's labels and script. A Latin query can also match a native-script
+  official title from a known label near the top of the results.
 - Remixes, TikTok edits, slowed/reverb, sped-up, covers, live, 8D, karaoke and similar variants
-  are skipped unless you type that keyword yourself. Lyrics uploads are used only when no
-  official upload is available; arbitrary covers are never used as a fallback.
+  are skipped unless you type that keyword yourself. Native-script variants (কভার, ਕਵਰ, କଭର,
+  கவர், कवर, etc.) are filtered too. Lyrics uploads are used only when no official upload is
+  available; arbitrary covers are never used as a fallback.
 - Audio-only formats are preferred (`bestaudio`, sorted by bitrate/sample rate); YouTube's muxed
   360p format 18 is accepted only as a last resort.
 - `MIN_AUDIO_KBPS` (default 120) rejects clearly low-bitrate streams before they are played.
@@ -65,7 +70,17 @@ Audio quality and start speed:
 - `VERIFY_YOUTUBE=0` (default) skips the extra stream probe. YouTube URLs are bound to the IP that
   resolved them, so probing them separately can fail and force a slow, low-quality fallback. Set
   `VERIFY_YOUTUBE=1` only if you need dead-link detection before playback.
-- The log line `youtube pick:` shows which title/channel/view count was actually selected.
+- The log line `youtube pick:` shows which title/channel/view count was selected and whether it
+  was official.
+
+Now-playing card:
+- The official upload's HD artwork (`maxresdefault`, then `maxres1/2/3`, then sd/hq fallbacks)
+  is sent as a photo. The caption is the player, and the 2×3 buttons sit directly below it in the
+  same bubble.
+- Title, artist and requester are clipped to one line each, so long names cannot push the card out
+  of shape.
+- If a lyrics upload is the only fallback, the card still uses the official song's artwork.
+- If Telegram cannot fetch a photo, the bot falls back to the same compact text card.
 
 It can also try importing cookies from an already logged-in browser profile
 (`COOKIES_FROM_BROWSER=auto`, or e.g. `chrome:Default`). This only imports an existing session; it
