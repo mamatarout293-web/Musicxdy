@@ -9,24 +9,31 @@ Env options (all optional):
   SOURCE_ORDER      e.g. "youtube,audius,soundcloud"   (subset / tie-break preference)
   SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET  optional Spotify catalog lookup credentials
   JAMENDO_CLIENT_ID free Jamendo key (enables the "jamendo" source)
-  COOKIES_TXT / COOKIES_BASE64   optional YouTube cookies (default: cookies.txt next to this file)\n  COOKIES_FROM_BROWSER           auto-detect an existing logged-in browser profile, or set chrome[:profile],firefox,etc.
+  COOKIES_URL       URL of a Netscape/JSON cookie export; re-downloaded every COOKIES_REFRESH seconds
+  COOKIES_REFRESH   seconds between COOKIES_URL refreshes (default 21600 = 6 hours)
+  COOKIES_FILE      path to a Netscape/JSON cookie file (default: cookies.txt next to this file)
+  COOKIES_TXT / COOKIES_BASE64   optional YouTube cookies (default: cookies.txt next to this file)
+  COOKIES_FROM_BROWSER           auto-detect an existing logged-in browser profile, or set chrome[:profile],firefox,etc.
   ENABLE_YOUTUBE                  set to 0 to disable YouTube (enabled by default)
   RESOLVE_TIMEOUT   max seconds spent on one search (default 55)
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import random
 import re
 import shutil
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 
 from yt_dlp import YoutubeDL
 
@@ -176,60 +183,201 @@ def _match_score(query: str, title: str, artist: str = "") -> float:
     return score
 
 
-def _validate_cookie_domains(data: str) -> int:
-    """Validate Netscape-format cookies and reject unrelated service credentials."""
-    allowed = {
-        "google.com", "www.google.com", "accounts.google.com", "ogs.google.com",
-        "youtube.com", "www.youtube.com", "m.youtube.com",
-    }
-    found = 0
-    for line_no, raw in enumerate(data.splitlines(), 1):
-        line = raw.strip()
-        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+# ───────────────────────── cookies ─────────────────────────
+# YouTube cookies are optional. They are only needed for videos that require a
+# signed-in account (age/region restricted). Normal songs resolve without them,
+# which is why the resolver tries cookie-less clients first: an expired export
+# must never be able to block playback.
+_COOKIE_DOMAINS = (
+    "youtube.com", "youtu.be", "youtube-nocookie.com",
+    "google.com", "googlevideo.com", "googleapis.com",
+    "gstatic.com", "ytimg.com", "googleusercontent.com",
+)
+_COOKIE_PATH = os.path.join(tempfile.gettempdir(), f"yt_cookies_{os.getpid()}.txt")
+try:
+    _COOKIE_REFRESH = float(os.environ.get("COOKIES_REFRESH", "21600") or 21600)
+except ValueError:
+    _COOKIE_REFRESH = 21600.0
+_COOKIE_LOCK = threading.Lock()
+_COOKIE_STATE: dict = {
+    "signature": None, "count": 0, "file_sig": None, "remote_at": 0.0, "source": "",
+}
+COOKIES: str | None = None
+
+
+def _is_google_cookie_domain(domain: str) -> bool:
+    d = (domain or "").lstrip(".").lower()
+    if not d:
+        return False
+    if any(d == suffix or d.endswith("." + suffix) for suffix in _COOKIE_DOMAINS):
+        return True
+    # Country domains such as google.co.in / accounts.google.co.uk
+    return bool(re.search(r"(?:^|\.)google\.[a-z]{2,3}(?:\.[a-z]{2})?$", d))
+
+
+def _netscape_cookie_rows(text: str) -> list[str]:
+    """Keep only Google/YouTube rows; a browser export also contains unrelated sites."""
+    rows = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw.lstrip("\ufeff").strip()
+        if not line:
             continue
-        # Netscape cookie files are tab-delimited. Splitting on the literal
-        # characters backslash+t rejects every otherwise-valid exported row.
+        prefix = ""
+        if line.startswith("#HttpOnly_"):
+            prefix, line = "#HttpOnly_", line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue
         fields = line.split("\t")
-        if len(fields) != 7:
-            raise ValueError(f"invalid Netscape cookie row at line {line_no}")
-        domain = fields[0].removeprefix("#HttpOnly_").lstrip(".").lower()
-        if domain not in allowed:
-            raise ValueError(f"cookie export contains an unrelated domain at line {line_no}")
-        found += 1
-    if not found:
-        raise ValueError("cookie export contains no supported Google/YouTube cookies")
-    return found
+        if len(fields) != 7 or not _is_google_cookie_domain(fields[0]):
+            continue
+        rows.append(prefix + "\t".join(fields))
+    return rows
 
 
-def _prepare_cookies() -> str | None:
-    """yt-dlp rewrites its cookie file, so work on a writable copy."""
-    dst = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+def _json_cookie_rows(text: str) -> list[str]:
+    data = json.loads(text)
+    if isinstance(data, dict):
+        data = data.get("cookies") or data.get("Cookies") or []
+    if not isinstance(data, list):
+        raise ValueError("cookie JSON must be a list of cookie objects")
+    rows = []
+    for cookie in data:
+        if not isinstance(cookie, dict):
+            continue
+        domain = str(cookie.get("domain") or "")
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not name or value is None or not _is_google_cookie_domain(domain):
+            continue
+        try:
+            expires = int(float(cookie.get("expirationDate") or cookie.get("expires")
+                                or cookie.get("expiry") or 0))
+        except (TypeError, ValueError):
+            expires = 0
+        prefix = "#HttpOnly_" if cookie.get("httpOnly") or cookie.get("httponly") else ""
+        include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+        secure = "TRUE" if cookie.get("secure") else "FALSE"
+        rows.append(f"{prefix}{domain}\t{include_sub}\t{cookie.get('path') or '/'}\t"
+                    f"{secure}\t{expires}\t{name}\t{value}")
+    return rows
+
+
+def _header_cookie_rows(text: str) -> list[str]:
+    """Accept a raw `Cookie: a=b; c=d` header pasted into COOKIES_TXT."""
+    rows = []
+    for part in text.split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name, value = name.strip(), value.strip()
+        if name:
+            rows.append(f".youtube.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}")
+    return rows
+
+
+def _cookie_row_key(row: str) -> tuple:
+    plain = row[len("#HttpOnly_"):] if row.startswith("#HttpOnly_") else row
+    fields = plain.split("\t")
+    return (fields[0].lower(), fields[2], fields[5]) if len(fields) == 7 else (row,)
+
+
+def _normalize_cookie_text(text: str) -> list[str]:
+    text = (text or "").strip().lstrip("\ufeff")
+    if not text:
+        raise ValueError("empty cookie data")
+    if text[0] in "[{":
+        rows = _json_cookie_rows(text)
+    elif "\t" in text:
+        rows = _netscape_cookie_rows(text)
+    else:
+        rows = _header_cookie_rows(text)
+    unique: dict[tuple, str] = {}
+    for row in rows:
+        unique[_cookie_row_key(row)] = row
+    if not unique:
+        raise ValueError("no Google/YouTube cookies found")
+    return list(unique.values())
+
+
+def _decode_cookie_base64(value: str) -> str:
+    cleaned = re.sub(r"\s+", "", value)
     try:
-        b64 = os.environ.get("COOKIES_BASE64", "").strip()
-        txt = os.environ.get("COOKIES_TXT", "")
-        if b64:
-            # Reject malformed Base64 instead of silently accepting a truncated export.
-            data = base64.b64decode(b64, validate=True).decode("utf-8")
-        elif txt.strip():
-            data = txt.replace("\\n", "\n")
-        else:
-            src = os.path.join(ROOT, "cookies.txt")
-            if not os.path.exists(src):
-                return None
-            with open(src, "r", encoding="utf-8") as f:
-                data = f.read()
-        cookie_count = _validate_cookie_domains(data)
-        with open(dst, "w", encoding="utf-8") as f:
-            f.write(data)
-        source = "COOKIES_BASE64" if b64 else ("COOKIES_TXT" if txt.strip() else "cookies.txt")
-        log(f"loaded {cookie_count} validated cookie entries from {source}")
-        return dst
-    except Exception as e:
-        log("cookies not loaded:", e)
-        return None
+        raw = base64.b64decode(cleaned, validate=True)
+    except Exception:
+        raw = base64.urlsafe_b64decode(cleaned + "=" * (-len(cleaned) % 4))
+    return raw.decode("utf-8-sig")
 
 
-COOKIES = _prepare_cookies()
+def _store_cookie_text(text: str, source: str) -> str:
+    global COOKIES
+    rows = _normalize_cookie_text(text)
+    content = "# Netscape HTTP Cookie File\n" + "\n".join(rows) + "\n"
+    signature = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if signature != _COOKIE_STATE["signature"]:
+        tmp = f"{_COOKIE_PATH}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp, _COOKIE_PATH)
+        _COOKIE_STATE.update(signature=signature, count=len(rows), source=source)
+        log(f"loaded {len(rows)} validated cookie entries from {source}")
+    COOKIES = _COOKIE_PATH
+    return COOKIES
+
+
+def _remote_cookie_text(url: str) -> str:
+    with _open(url, {"Accept": "text/plain,*/*"}, timeout=10) as response:
+        return response.read(2_000_000).decode("utf-8-sig", "replace")
+
+
+def refresh_cookies(force: bool = False) -> str | None:
+    """Load cookies from env/URL/file and hot-reload when they change.
+
+    Sources, in priority order: COOKIES_BASE64, COOKIES_TXT, COOKIES_URL
+    (re-downloaded every COOKIES_REFRESH seconds), then ./cookies.txt.
+    A bad or expired export never clears the last good cookie file.
+    """
+    global COOKIES
+    with _COOKIE_LOCK:
+        try:
+            b64 = os.environ.get("COOKIES_BASE64", "").strip()
+            if b64:
+                return _store_cookie_text(_decode_cookie_base64(b64), "COOKIES_BASE64")
+
+            txt = os.environ.get("COOKIES_TXT", "")
+            if txt.strip():
+                return _store_cookie_text(txt.replace("\\n", "\n").replace("\\t", "\t"),
+                                          "COOKIES_TXT")
+
+            url = os.environ.get("COOKIES_URL", "").strip()
+            if url:
+                if force or time.time() - _COOKIE_STATE["remote_at"] >= _COOKIE_REFRESH:
+                    _COOKIE_STATE["remote_at"] = time.time()
+                    try:
+                        return _store_cookie_text(_remote_cookie_text(url), "COOKIES_URL")
+                    except Exception as e:
+                        log("COOKIES_URL refresh failed (keeping last good cookies):", str(e)[:140])
+                if COOKIES:
+                    # Remote is the source of truth once loaded; a stale local
+                    # cookies.txt must not replace it.
+                    return COOKIES
+
+            custom_file = os.environ.get("COOKIES_FILE", "").strip()
+            src = custom_file or os.path.join(ROOT, "cookies.txt")
+            try:
+                stat = os.stat(src)
+            except OSError:
+                return COOKIES
+            file_sig = (stat.st_mtime_ns, stat.st_size)
+            if force or file_sig != _COOKIE_STATE["file_sig"]:
+                _COOKIE_STATE["file_sig"] = file_sig
+                with open(src, "r", encoding="utf-8-sig") as handle:
+                    return _store_cookie_text(handle.read(), "COOKIES_FILE" if custom_file else "cookies.txt")
+        except Exception as e:
+            log("cookies not loaded:", str(e)[:160])
+        return COOKIES
+
+
+COOKIES = refresh_cookies(force=True)
 
 
 def _browser_cookie_specs() -> list[tuple[str, str | None, None, None]]:
@@ -289,7 +437,27 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
     return o
 
 
-def _ydl_entries(opts: dict, target: str) -> list[dict]:
+@contextmanager
+def _cookie_copy(path: str):
+    """Give yt-dlp a throwaway cookie jar.
+
+    yt-dlp rewrites the file it is given. Sharing one path between concurrent
+    searches can corrupt it, and writing back can also drop cookies YouTube
+    refreshed. Each extraction therefore gets its own copy.
+    """
+    fd, tmp = tempfile.mkstemp(prefix="ytcookies-", suffix=".txt")
+    os.close(fd)
+    try:
+        shutil.copyfile(path, tmp)
+        yield tmp
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _extract_entries(opts: dict, target: str) -> list[dict]:
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(target, download=False)
     if not info:
@@ -298,6 +466,14 @@ def _ydl_entries(opts: dict, target: str) -> list[dict]:
     if not entries:
         raise NotFound("no results")
     return entries
+
+
+def _ydl_entries(opts: dict, target: str) -> list[dict]:
+    cookiefile = opts.get("cookiefile")
+    if cookiefile and os.path.exists(cookiefile):
+        with _cookie_copy(cookiefile) as tmp:
+            return _extract_entries({**opts, "cookiefile": tmp}, target)
+    return _extract_entries(opts, target)
 
 
 def _norm(info: dict, source: str) -> dict:
@@ -316,12 +492,15 @@ def _norm(info: dict, source: str) -> dict:
 
 
 # ───────────────────────── sources ─────────────────────────
-# Tried in order until YouTube returns a playable audio format
+# Tried in order until YouTube returns a playable audio format. Cookie-less
+# clients come first: an expired export must never block ordinary songs.
 YT_ATTEMPTS = [
-    {},                                                 # default clients + cookies
-    {"clients": ["tv", "web_safari"]},                  # with cookies
-    {"clients": ["android_vr"], "cookies": False},      # no cookies, no JS needed
-    {"clients": ["mweb"], "cookies": False},
+    {"clients": ["default"], "cookies": False},                              # best audio, no cookies
+    {"clients": ["default"], "cookies": True},                               # signed-in (age/region)
+    {"clients": ["tv", "web_safari"], "cookies": False},                     # PO-token provider
+    {"clients": ["tv", "web_safari"], "cookies": True},                      # PO token + cookies
+    {"clients": ["tv_embedded", "tv_samsung", "visionos"], "cookies": False},  # explicit high-quality clients
+    {"clients": ["tv_simply", "mweb", "android_vr"], "cookies": False},      # last resort (muxed, lower bitrate)
 ]
 
 
@@ -334,8 +513,19 @@ def _is_bot_check(e: Exception) -> bool:
     return "not a bot" in m or "sign in to confirm" in m
 
 
+def _is_cookie_error(e: Exception) -> bool:
+    """Errors that usually disappear when the cookie file is not sent at all."""
+    m = str(e).lower()
+    return any(token in m for token in (
+        "cookie", "login required", "requires login", "please sign in",
+        "page needs to be reloaded", "account cookies", "precondition check failed",
+    ))
+
+
 def _yt_attempts() -> list[dict]:
-    attempts = list(YT_ATTEMPTS)
+    # Cookie attempts are pointless without a loaded cookie file; skipping them
+    # keeps a stale export from costing extra round-trips.
+    attempts = [a for a in YT_ATTEMPTS if not a.get("cookies") or COOKIES]
     # If ordinary extraction is challenged, try importing an already-authenticated
     # browser profile. This cannot create a Google login or bypass verification.
     for browser_spec in _browser_cookie_specs():
@@ -345,8 +535,10 @@ def _yt_attempts() -> list[dict]:
 
 def _yt_extract(url: str) -> dict:
     """Resolve ONE video url to a stream, trying each client strategy in turn."""
+    refresh_cookies()
     last: Exception | None = None
     for a in _yt_attempts():
+        used_cookies = bool(a.get("cookies", True) and COOKIES)
         try:
             entries = _ydl_entries(
                 _ydl_opts(a.get("cookies", True), a.get("clients"), a.get("browser"), YT_PROXY), url
@@ -357,7 +549,8 @@ def _yt_extract(url: str) -> dict:
         except Exception as e:
             last = e
             log("youtube attempt failed:", str(e)[:160])
-            if _is_bot_check(e) and a.get("cookies", True) and COOKIES:
+            if used_cookies and (_is_bot_check(e) or _is_cookie_error(e)):
+                # Same client, but without the possibly expired cookies.
                 try:
                     entries = _ydl_entries(
                         _ydl_opts(cookies=False, clients=a.get("clients"), proxy=YT_PROXY), url
@@ -369,13 +562,29 @@ def _yt_extract(url: str) -> dict:
     raise last or RuntimeError("youtube failed")
 
 
+def _search_entries(target: str) -> list[dict]:
+    """Flat search first (fast, no player request), then once with cookies if blocked."""
+    opts = _ydl_opts(cookies=False, proxy=YT_PROXY)
+    opts["extract_flat"] = True
+    try:
+        return _ydl_entries(opts, target)
+    except Exception as e:
+        if not COOKIES:
+            raise
+        log("youtube search failed without cookies, retrying with cookies:", str(e)[:120])
+        retry = _ydl_opts(cookies=True, proxy=YT_PROXY)
+        retry["extract_flat"] = True
+        return _ydl_entries(retry, target)
+
+
 def _youtube(target: str) -> dict:
     cached = _YT_CACHE.get(target)
     if cached and time.time() - cached[0] < _YT_CACHE_TTL:
         return cached[1]
+    refresh_cookies()
     if not COOKIES and not _browser_cookie_specs():
-        log("no YouTube cookie file or logged-in browser profile found; "
-            "set COOKIES_BASE64/COOKIES_TXT or provide an authenticated browser profile")
+        log("no YouTube cookies loaded; using cookie-less clients "
+            "(set COOKIES_URL/COOKIES_BASE64/COOKIES_TXT only for age-restricted videos)")
     m = re.match(r"ytsearch\d*:(.*)", target, re.I)
     if not m:
         # Direct user-provided YouTube links are resolved as requested.
@@ -383,13 +592,10 @@ def _youtube(target: str) -> dict:
         _YT_CACHE[target] = (time.time(), info)
         return info
 
-    # Search is a cheap flat listing: it needs no player request, so it is fast
-    # and is not hit by the "confirm you're not a bot" check. Only the chosen
-    # candidates go through full stream extraction (previously all 10 did).
+    # Search is a cheap flat listing: it needs no player request, so it is fast.
+    # Only the chosen candidates go through full stream extraction (previously all 10 did).
     search_query = m.group(1).strip()
-    opts = _ydl_opts(cookies=False, proxy=YT_PROXY)
-    opts["extract_flat"] = True
-    entries = _ydl_entries(opts, target)
+    entries = _search_entries(target)
 
     def artist_of(e):
         return e.get("artist") or e.get("uploader") or e.get("channel") or ""

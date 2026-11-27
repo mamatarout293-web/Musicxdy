@@ -1,3 +1,6 @@
+import json
+import os
+import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -180,6 +183,144 @@ class PlayableTests(unittest.TestCase):
         "https://stream.example/audio", 416, "Range Not Satisfiable", {}, None))
     def test_rejects_range_not_satisfiable(self, _open_stream):
         self.assertFalse(sources.playable("https://stream.example/audio"))
+
+
+class CookieParsingTests(unittest.TestCase):
+    def test_netscape_export_filters_unrelated_domains(self):
+        data = "\n".join([
+            "# Netscape HTTP Cookie File",
+            ".youtube.com\tTRUE\t/\tTRUE\t2147483647\tSID\tabc",
+            "consent.youtube.com\tTRUE\t/\tFALSE\t0\tCONSENT\tyes",
+            ".google.co.in\tTRUE\t/\tTRUE\t2147483647\tNID\txyz",
+            ".example.com\tTRUE\t/\tFALSE\t0\tsession\tsecret",
+            "#HttpOnly_.google.com\tTRUE\t/\tTRUE\t2147483647\tHSID\thidden",
+        ])
+
+        rows = sources._normalize_cookie_text(data)
+
+        names = {row.split("\t")[5] for row in rows}
+        self.assertEqual(names, {"SID", "CONSENT", "NID", "HSID"})
+        self.assertFalse(any("example.com" in row for row in rows))
+        self.assertTrue(any(row.startswith("#HttpOnly_") for row in rows))
+
+    def test_json_export_is_converted(self):
+        data = json.dumps([
+            {"domain": ".youtube.com", "name": "SID", "value": "abc", "path": "/",
+             "secure": True, "expirationDate": 1_900_000_000, "httpOnly": True},
+            {"domain": ".example.com", "name": "session", "value": "secret"},
+        ])
+
+        rows = sources._normalize_cookie_text(data)
+
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].startswith("#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t"))
+
+    def test_raw_cookie_header_is_accepted(self):
+        rows = sources._normalize_cookie_text("SID=abc; HSID=def")
+
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row.startswith(".youtube.com\tTRUE\t/\tTRUE\t") for row in rows))
+
+    def test_unrelated_export_is_rejected(self):
+        with self.assertRaises(ValueError):
+            sources._normalize_cookie_text(".example.com\tTRUE\t/\tFALSE\t0\ts\ts")
+
+
+class CookieStoreTests(unittest.TestCase):
+    def test_cookie_copy_is_throwaway(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as handle:
+            handle.write("original")
+            path = handle.name
+        try:
+            with sources._cookie_copy(path) as tmp:
+                self.assertNotEqual(tmp, path)
+                with open(tmp, "w", encoding="utf-8") as writer:
+                    writer.write("changed by yt-dlp")
+            with open(path, encoding="utf-8") as reader:
+                self.assertEqual(reader.read(), "original")
+        finally:
+            os.unlink(path)
+
+    def test_changed_cookies_file_is_hot_reloaded(self):
+        old_cookies = sources.COOKIES
+        with tempfile.TemporaryDirectory() as folder:
+            cookie_file = os.path.join(folder, "cookies.txt")
+            with open(cookie_file, "w", encoding="utf-8") as handle:
+                handle.write(".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tone\n")
+            with patch.object(sources, "ROOT", folder), \
+                    patch.object(sources, "_COOKIE_PATH", os.path.join(folder, "out.txt")), \
+                    patch.object(sources, "_COOKIE_STATE", {
+                        "signature": None, "count": 0, "file_sig": None,
+                        "remote_at": 0.0, "source": "",
+                    }), \
+                    patch.dict(os.environ, {}, clear=True):
+                try:
+                    sources.refresh_cookies(force=True)
+                    self.assertEqual(sources._COOKIE_STATE["count"], 1)
+
+                    with open(cookie_file, "w", encoding="utf-8") as handle:
+                        handle.write(".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tone\n"
+                                     ".google.com\tTRUE\t/\tTRUE\t0\tHSID\ttwo\n")
+                    stat = os.stat(cookie_file)
+                    os.utime(cookie_file, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+                    sources.refresh_cookies()
+                    self.assertEqual(sources._COOKIE_STATE["count"], 2)
+                finally:
+                    sources.COOKIES = old_cookies
+
+
+class YoutubeAttemptOrderTests(unittest.TestCase):
+    @patch("sources._browser_cookie_specs", return_value=[])
+    def test_cookie_less_high_quality_client_runs_first(self, _browsers):
+        with patch.object(sources, "COOKIES", None):
+            attempts = sources._yt_attempts()
+
+        self.assertFalse(any(attempt.get("cookies") for attempt in attempts))
+        self.assertEqual(attempts[0]["clients"], ["default"])
+        self.assertEqual(attempts[-1]["clients"], ["tv_simply", "mweb", "android_vr"])
+
+    @patch("sources._browser_cookie_specs", return_value=[])
+    def test_cookie_attempts_only_when_cookies_are_loaded(self, _browsers):
+        with patch.object(sources, "COOKIES", "/tmp/cookies.txt"):
+            attempts = sources._yt_attempts()
+
+        self.assertTrue(any(attempt.get("cookies") for attempt in attempts))
+
+    def test_cookie_error_retries_same_client_without_cookiefile(self):
+        def extract(opts, _target):
+            if "cookiefile" in opts:
+                raise RuntimeError("The page needs to be reloaded.")
+            return [{"title": "Song"}]
+
+        with patch.object(sources, "COOKIES", "/tmp/cookies.txt"), \
+                patch.object(sources, "_yt_attempts", return_value=[
+                    {"cookies": True, "clients": ["tv"]}
+                ]), \
+                patch.object(sources, "_ydl_entries", side_effect=extract) as ydl_entries, \
+                patch.object(sources, "_finish", return_value={"source": "youtube"}) as finish:
+            result = sources._yt_extract("https://youtube.com/watch?v=example")
+
+        self.assertEqual(result, {"source": "youtube"})
+        self.assertNotIn("cookiefile", ydl_entries.call_args_list[1].args[0])
+        self.assertEqual(ydl_entries.call_count, 2)
+        finish.assert_called_once()
+
+    def test_search_retries_with_cookies_when_cookie_less_search_fails(self):
+        used_cookies = []
+
+        def entries(opts, _target):
+            used_cookies.append("cookiefile" in opts)
+            if "cookiefile" not in opts:
+                raise RuntimeError("search blocked")
+            return [{"id": "x"}]
+
+        with patch.object(sources, "COOKIES", "/tmp/cookies.txt"), \
+                patch.object(sources, "_ydl_entries", side_effect=entries):
+            result = sources._search_entries("ytsearch1:test")
+
+        self.assertEqual(result, [{"id": "x"}])
+        self.assertEqual(used_cookies, [False, True])
 
 
 if __name__ == "__main__":
