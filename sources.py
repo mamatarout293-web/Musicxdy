@@ -36,6 +36,9 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like
 HTTP_TIMEOUT = 8
 DEADLINE = int(os.environ.get("RESOLVE_TIMEOUT", "55"))
 URL_RE = re.compile(r"^https?://", re.I)
+# Optional HTTP proxy (ideally residential) used ONLY for YouTube. YouTube stream
+# links are locked to the IP that resolved them, so playback must use it too.
+YT_PROXY = os.environ.get("YT_PROXY", "").strip() or None
 
 
 class NotFound(Exception):
@@ -55,10 +58,16 @@ def log(*a):
 
 
 # ───────────────────────── helpers ─────────────────────────
-def _open(url: str, headers: dict | None = None, timeout: float = HTTP_TIMEOUT):
+def _open(url: str, headers: dict | None = None, timeout: float = HTTP_TIMEOUT,
+          proxy: str | None = None):
     h = {"User-Agent": UA, "Accept": "*/*"}
     h.update(headers or {})
-    return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
+    req = urllib.request.Request(url, headers=h)
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 def get_json(url: str, timeout: float = HTTP_TIMEOUT):
@@ -66,13 +75,13 @@ def get_json(url: str, timeout: float = HTTP_TIMEOUT):
         return json.loads(r.read(3_000_000).decode("utf-8", "replace"))
 
 
-def playable(url: str, headers: dict | None = None) -> bool:
+def playable(url: str, headers: dict | None = None, proxy: str | None = None) -> bool:
     """Verify that a URL returns readable media bytes, not just an HTTP response."""
     h = dict(headers or {})
     h.pop("Accept-Encoding", None)
     h["Range"] = "bytes=0-4095"
     try:
-        with _open(url, h) as r:
+        with _open(url, h, proxy=proxy) as r:
             # A range request may be honoured (206) or ignored (200). Other statuses
             # are not evidence of a usable stream; in particular, 416 is not playable.
             if r.status not in (200, 206):
@@ -112,7 +121,7 @@ def _finish(info: dict) -> dict:
     except (TypeError, ValueError):
         pass
     headers = info.get("headers") or {}
-    if not playable(info["url"], headers):
+    if not playable(info["url"], headers, YT_PROXY if info.get("source") == "youtube" else None):
         raise RuntimeError(f"{info.get('source')}: stream not reachable")
     # MediaStream expects a mapping of individual HTTP header names to values.
     # Keep them separate: folding Referer/Accept into User-Agent creates one invalid header.
@@ -252,7 +261,8 @@ def _browser_cookie_specs() -> list[tuple[str, str | None, None, None]]:
 
 
 def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
-              browser: tuple[str, str | None, None, None] | None = None) -> dict:
+              browser: tuple[str, str | None, None, None] | None = None,
+              proxy: str | None = None) -> dict:
     o = {
         "format": "bestaudio[acodec!=none]/best[acodec!=none]/best",
         "js_runtimes": {"deno": {}, "node": {}},
@@ -268,6 +278,8 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
         o["cookiefile"] = COOKIES
     elif browser:
         o["cookiesfrombrowser"] = browser
+    if proxy:
+        o["proxy"] = proxy
     if clients:
         o["extractor_args"] = {"youtube": {"player_client": clients}}
     return o
@@ -333,7 +345,7 @@ def _yt_extract(url: str) -> dict:
     for a in _yt_attempts():
         try:
             entries = _ydl_entries(
-                _ydl_opts(a.get("cookies", True), a.get("clients"), a.get("browser")), url
+                _ydl_opts(a.get("cookies", True), a.get("clients"), a.get("browser"), YT_PROXY), url
             )
             return _finish(_norm(entries[0], "youtube"))
         except NotFound as e:
@@ -362,7 +374,7 @@ def _youtube(target: str) -> dict:
     # and is not hit by the "confirm you're not a bot" check. Only the chosen
     # candidates go through full stream extraction (previously all 10 did).
     search_query = m.group(1).strip()
-    opts = _ydl_opts(cookies=False)
+    opts = _ydl_opts(cookies=False, proxy=YT_PROXY)
     opts["extract_flat"] = True
     entries = _ydl_entries(opts, target)
 
