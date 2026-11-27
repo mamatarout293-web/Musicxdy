@@ -25,6 +25,12 @@ AUDIO_NORMALIZE=1 (optional; EBU R128 loudness normalization, 0 to disable)
 ```
 3. Railway redeploys. Open **Deployments → View logs**; you should see `starting bot.py`.
 
+> **Only one service may run the bot.** If this repo is connected to more than one Railway
+> project/service, two bot copies join the same voice chat and replace each other's stream. The
+> song then starts, cuts after a few seconds, and restarts. `main.py` defaults to
+> `BOT_SERVICE_NAME=web`; any other service stays up only for the health check. Set
+> `BOT_SERVICE_NAME` to the service that should run the bot, or delete/stop the duplicate service.
+
 YouTube works without cookies for ordinary songs. The resolver tries cookie-less high-quality
 clients first (`default`, then `tv`/`web_safari` with the PO-token provider, then `tv_samsung`/
 `visionos`/`tv_embedded`, and finally lower-bitrate clients). This means an expired cookie export

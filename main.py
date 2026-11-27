@@ -20,7 +20,14 @@ ROOT = config.ROOT
 os.chdir(ROOT)
 config.load_env()
 
-state = {"since": time.time(), "restarts": 0, "bot": "starting", "last_exit": None}
+state = {
+    "since": time.time(),
+    "restarts": 0,
+    "bot": "starting",
+    "last_exit": None,
+    "service": os.environ.get("RAILWAY_SERVICE_NAME", ""),
+    "project": os.environ.get("RAILWAY_PROJECT_NAME", ""),
+}
 child: subprocess.Popen | None = None
 pot_provider: subprocess.Popen | None = None
 stopping = False
@@ -129,7 +136,22 @@ signal.signal(signal.SIGINT, shutdown)
 
 def main():
     global child
+    service = os.environ.get("RAILWAY_SERVICE_NAME", "").strip()
+    project = os.environ.get("RAILWAY_PROJECT_NAME", "").strip()
+    log(f"service={service or '?'} project={project or '?'}")
     threading.Thread(target=serve_health, daemon=True).start()
+
+    # Two copies of the bot in the same voice chat replace each other's stream,
+    # which looks like the song restarting every few seconds. Keep only the named
+    # service running the bot; other services stay up for Railway's health check.
+    allowed_service = os.environ.get("BOT_SERVICE_NAME", "web").strip()
+    if service and allowed_service and service != allowed_service:
+        state["bot"] = f"health-only (bot runs on {allowed_service})"
+        log(f"BOT_SERVICE_NAME={allowed_service}; this service ({service}) will only answer health checks")
+        while not stopping:
+            time.sleep(1)
+        return
+
     start_pot_provider()
 
     # On a redeploy the old container may still be alive for a few seconds. Using the same Telegram

@@ -74,6 +74,24 @@ def log(*a):
     print("[sources]", *a, flush=True)
 
 
+def _preload_ytdlp_plugins():
+    """Load yt-dlp plugins once before resolver threads start.
+
+    yt-dlp's plugin registry is not safe to initialise concurrently: two search
+    threads can both import getpot_bgutil_http and the loser raises
+    "PoTokenProvider BgUtilHTTP already registered".
+    """
+    try:
+        with YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True,
+                        "noplaylist": True}) as ydl:
+            ydl.get_info_extractor("Youtube")
+    except Exception as e:
+        log("yt-dlp plugin preload failed:", str(e)[:140])
+
+
+_preload_ytdlp_plugins()
+
+
 # ───────────────────────── helpers ─────────────────────────
 def _open(url: str, headers: dict | None = None, timeout: float = HTTP_TIMEOUT,
           proxy: str | None = None):
@@ -685,6 +703,9 @@ def _ydl_opts(cookies: bool = True, clients: list[str] | None = None,
         "socket_timeout": 8,
         "retries": 1,
         "extractor_retries": 1,
+        # Railway containers are IPv4-only in practice. Letting yt-dlp hand out a
+        # googlevideo URL bound to an IPv6 address makes ffmpeg start and then stall.
+        "source_address": "0.0.0.0",
         "extractor_args": {
             "youtube": {"player_client": ["tv_embedded", "web_safari", "default"]},
             "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
