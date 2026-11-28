@@ -6,6 +6,7 @@ if not exist .venv\Scripts\python.exe (
   pause
   exit /b 1
 )
+if not defined BOT_SESSION_DIR set "BOT_SESSION_DIR=%~dp0"
 call .venv\Scripts\activate
 python main.py
 pause

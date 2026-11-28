@@ -7,7 +7,7 @@ echo.
 where py >nul 2>nul
 if errorlevel 1 (
   echo Python not found.
-  echo Install Python 3.11 (64-bit) from https://www.python.org/downloads/release/python-3119/
+  echo Install Python 3.11 64-bit from https://www.python.org/downloads/release/python-3119/
   echo Tick "Add python.exe to PATH" during installation.
   pause
   exit /b 1
@@ -16,7 +16,7 @@ if errorlevel 1 (
 py -3.11 -c "import sys" >nul 2>nul
 if errorlevel 1 (
   echo Python 3.11 not found.
-  echo Install Python 3.11 (64-bit) from https://www.python.org/downloads/release/python-3119/
+  echo Install Python 3.11 64-bit from https://www.python.org/downloads/release/python-3119/
   echo Do not use Python 3.12+; the audio crypto package has no Windows wheel there.
   pause
   exit /b 1

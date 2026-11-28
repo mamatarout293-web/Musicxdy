@@ -61,7 +61,10 @@ AUDIO_QUALITY = {
 # Railway deploy used to start with a brand-new in-memory session. Keep the bot session on disk
 # when a persistent directory exists (mount a Railway volume at /data, or set BOT_SESSION_DIR) so
 # redeploys and restarts reuse it instead of logging in again.
-_sess_dir = os.environ.get("BOT_SESSION_DIR") or ("/data" if os.path.isdir("/data") else "")
+_sess_dir = (
+    os.environ.get("BOT_SESSION_DIR")
+    or ("/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__)))
+)
 if _sess_dir and not os.access(_sess_dir, os.W_OK):
     _sess_dir = ""
 if _sess_dir:
